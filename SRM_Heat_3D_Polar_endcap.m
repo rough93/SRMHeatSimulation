@@ -50,14 +50,32 @@ BC.eps_in  = 0.8;
 BC.eps_out = 0.8;
 BC.sigma = 5.670374419e-8;
 
-time.dt = 0.050;
-time.t_final = 100.0;
+% ---- Step 3: aft cavity inner-wall gas-side BC (reduced vs port) ----
+BC.h_in_cav   = 200;     % [W/m^2-K] cavity-side convection (lower than BC.h_in)
+BC.eps_in_cav = 0.8;     % [-] emissivity for cavity region (can keep same as eps_in)
+BC.T_gas_cav_mode = 'same';  % 'same' uses T_gas, or 'ambient' uses BC.T_amb
 
-cfg.store_every = 10;     % store every N steps
+BC.h_z0 = 30;               % end convection at z=0 if endBC='robin'
+BC.h_zL = 30;               % end convection at z=L if endBC='robin'
+cfg.L = 1.0;              % unit length (m)
+
+time.dt = 0.050;
+time.t_final = 50.0;
+
+cfg.store_every = 1;     % store every N steps
 cfg.max_cells = 2e6;      % safety
-cfg.Ntheta = 2;          % circumferential resolution (>= 8)
-cfg.Nz = 500;              % axial resolution (>=1)
+cfg.Ntheta = 30;          % circumferential resolution (>= 8)
+cfg.Nz = 100;              % axial resolution (>=1)
 cfg.endBC = 'adiabatic';    % 'adiabatic' or 'robin' at z=0 and z=L
+
+% ---- Step 4: nozzle/throat proxy for aft-cavity convection ----
+cfg.noz.enableProxy = true;
+cfg.noz.r_t = 0.010;                 % [m] throat radius (user input)
+cfg.noz.CdA = 1.0;                   % dimensionless scale factor (leave 1 for now)
+cfg.noz.h_cav_base = 200;            % [W/m^2-K] baseline cavity h (what you used in Step 3)
+cfg.noz.alpha = 0.5;                 % exponent for area-ratio scaling (0.5 is a safe start)
+cfg.noz.h_cav_min = 10;              % [W/m^2-K] floor to avoid "zero convection"
+cfg.noz.h_cav_max = 800;             % [W/m^2-K] ceiling to avoid runaway h
 
 % ---- Optional endcap / bulkhead thermal mass (lumped nodes coupled to z-ends) ----
 cfg.endcap.enable = true;        % set false to disable endcap nodes
@@ -66,20 +84,34 @@ cfg.endcap.thickness = 0.012;    % [m] effective bulkhead thickness participatin
 cfg.endcap.k      = 205;         % [W/m-K] bulkhead conductivity (e.g., aluminum ~205)
 cfg.endcap.rho    = 2700;        % [kg/m^3]
 cfg.endcap.cp     = 900;         % [J/kg-K]
-cfg.endcap.h_in   = 200;         % [W/m^2-K] bulkhead side exposed to hot gas (inside motor)
-cfg.endcap.eps_in = 0.8;         % emissivity for inside radiation
-cfg.endcap.h_out  = 30;          % [W/m^2-K] bulkhead side exposed to ambient (outside)
-cfg.endcap.eps_out = 0.8;        % emissivity for outside radiation
+cfg.endcap.h_in   = 0;           % [W/m^2-K]
+cfg.endcap.eps_in = 0;           % [-]
+cfg.endcap.h_out  = 0;           % [W/m^2-K]
+cfg.endcap.eps_out = 0;          % [-]
 
-BC.h_z0 = 30;               % end convection at z=0 if endBC='robin'
-BC.h_zL = 30;               % end convection at z=L if endBC='robin'
-cfg.L = 1.0;              % unit length (m)
+% ---- Endcap gas exposure flags (Step 1: inhibited grain end face) ----
+cfg.endcap.gas_exposed_z0 = false;   % inhibited/insulated end at z=0
+cfg.endcap.gas_exposed_zL = true;    % nozzle/free-volume end at z=L
+
+% ---- Step 2: axial insulation on inner wall near inhibited end ----
+cfg.wall_insul.enable = true;
+cfg.wall_insul.end    = 'z0';      % 'z0' or 'zL'
+cfg.wall_insul.length = 0.03;      % [m] axial insulation length
+cfg.wall_insul.factor = 0.0;       % 0 = fully insulated, 0.1 = partial, etc.
+
+% ---- Axial regression / free-volume model (minimal) ----
+cfg.grain.enable_axial_regression = true;
+cfg.grain.Lg0 = cfg.L;         % initial grain length, can be < cfg.L later
+cfg.grain.rb_end = burn.rburn; % rb_end = rb_radial
 
 % ---- runtime status monitoring ----
 cfg.status_every = 20;     % print every N time steps
 cfg.time_warn    = 2.0;    % warn if a step takes > this many seconds
-cfg.doEnergyDiagnostics = false;     % master switch for all plots/prints below
-cfg.doDeletionDiagnostics = false;   % requires Qcond12A_hist + willDel_hist; set false to skip those plots
+cfg.doEnergyDiagnostics = true;     % master switch for all plots/prints below
+cfg.doDeletionDiagnostics = true;   % requires Qcond12A_hist + willDel_hist
+
+% ---- NEW: diag flag (used by the drop-in block) ----
+cfg.diag.consistency = true;
 
 %% -------------------- Build polar FV grid --------------------
 dr = burn.rburn * time.dt;         % radial step aligned to burn per step
@@ -91,7 +123,6 @@ Ntheta = cfg.Ntheta;
 
 Nz = cfg.Nz;
 dz = cfg.L / Nz;
-%z_centers = ((1:Nz) - 0.5) * dz;
 
 nCells = Nr * Ntheta * Nz;  % 3D cells
 if nCells > cfg.max_cells
@@ -112,6 +143,7 @@ else
     Tcap0 = [];
     TcapL = [];
 end
+
 % diagnostics: rough Fourier number using smallest ring dr
 alpha_prop = prop.k / (prop.rho*prop.cp);
 Fo = alpha_prop * time.dt / dr^2;
@@ -121,54 +153,82 @@ fprintf('Grid: Nr=%d, Ntheta=%d, dr=%.6g m, dt=%.6g s, Fo_prop~%.3g\n', Nr, Nthe
 nsteps = round(time.t_final / time.dt);
 
 % ---- Energy balance tracking ----
-E_solid_hist   = nan(nsteps+1,1);   % total internal energy [J] (per unit length if L=1)
-dE_hist        = nan(nsteps,1);     % stepwise delta E
-dQnet_hist     = nan(nsteps,1);     % stepwise net boundary heat into solid
-closure_hist   = nan(nsteps,1);     % dE - dQnet
-relerr_hist    = nan(nsteps,1);     % (dE - dQnet)/max(|dQnet|,|dE|)
-Qcond12A_hist = nan(nsteps,1);
-Erem_hist    = nan(nsteps,1);
-willDel_hist = false(nsteps,1);
-Qcond12A_hist = nan(nsteps,1);
+N = nsteps;  % number of steps with solves
+E_solid_hist   = nan(N+2,1);   % carry state, needs step+2 indexing
+dE_hist        = nan(N,1);
+dQnet_hist     = nan(N,1);
+closure_hist   = nan(N,1);
+relerr_hist    = nan(N,1);
+Qcond12A_hist  = nan(N,1);
+Erem_hist      = nan(N,1);
+willDel_hist   = false(N,1);
 
-% store initial energy
-E_solid_hist(1) = solid_internal_energy(T, r_faces, dtheta, dz, rhoCp_ring);
-%times = [];
-%Tout_avg = [];
-%Tout_max = [];
+closure_pre_hist  = nan(N,1);
+closure_post_hist = nan(N,1);
+Qdel_hist         = nan(N,1);
+
+% ---- Ab-implied + residual storage ----
+dQimplied_hist      = nan(N,1);
+dQimplied_wall_hist = nan(N,1);
+dQimplied_cap_hist  = nan(N,1);
+dEimplied_hist      = nan(N,1);
+residAb_hist        = nan(N,1);
+
+% ---- comparison heat histories ----
+dQnet_masked_hist   = nan(N,1);
+dQnet_unmasked_hist = nan(N,1);
+dqnet_Tnew_hist     = nan(N,1);  % inner evaluated with Tnew
+dqnet_Tprev_hist    = nan(N,1);  % inner evaluated with Tprev
+
+% store initial energy (t=0 state)
+E_solid_hist(1) = solid_internal_energy(T, r_faces, dtheta, dz, rhoCp_ring) ...
+    + endcap_internal_energy(Tcap0, TcapL, r_faces, cfg, BC);
+
 snap = struct('t',{},'r_centers',{},'theta',{},'T',{});
 
+% ---- Step 2: axial inner-wall insulation mask ----
+useWallInsul = isfield(cfg,'wall_insul') && isfield(cfg.wall_insul,'enable') && cfg.wall_insul.enable;
+
+if useWallInsul
+    z_centers = ((1:Nz) - 0.5) * dz;
+    m_in = ones(Nz,1);  % multiplier for inner wall gas BC
+
+    if strcmpi(cfg.wall_insul.end,'z0')
+        mask = z_centers <= cfg.wall_insul.length;
+    elseif strcmpi(cfg.wall_insul.end,'zL')
+        mask = z_centers >= (max(z_centers) - cfg.wall_insul.length);
+    else
+        error('cfg.wall_insul.end must be ''z0'' or ''zL''.');
+    end
+
+    m_in(mask) = cfg.wall_insul.factor;
+else
+    m_in = ones(Nz,1);
+end
+
+% Storage buffers
+Tout3D_store = [];
+t_store      = [];
+
+%% =========================
+% MAIN TIME LOOP
+%% =========================
 for step = 0:nsteps
     t = step * time.dt;
 
     % ---- store ----
-    if mod(step, cfg.store_every)==0
-        %times(end+1,1) = t;
+    if mod(step, cfg.store_every) == 0
         T2 = mean(T,3);  % axial average for plotting/stats
-        %[Tavg, Tmax] = outer_wall_stats(T2);
-        %Tout_avg(end+1,1) = Tavg;
-        %Tout_max(end+1,1) = Tmax;
 
         snap(end+1).t = t;
         snap(end).r_centers = r_centers;
         snap(end).theta = theta_centers;
         snap(end).T = T2;
 
-        % ---- Store 3D outer-surface temperature map for animation ----
-        % Tout3D_store will be Ntheta x Nz x Nt_store
-        if ~exist('Tout3D_store','var')
-            Tout3D_store = [];
-            t_store = [];
-        end
-
         t_store(end+1,1) = t;
-
-        % outer surface temperature as a function of theta and z
-        Tout_theta_z = squeeze(T(end,:,:));        % size: [Ntheta x Nz]
+        Tout_theta_z = squeeze(T(end,:,:));        % [Ntheta x Nz]
         Tout3D_store(:,:,end+1) = Tout_theta_z;    % append along 3rd dim
 
-
-        % 1D equivalents for original-code style plots
         snap(end).Tbar_r = mean(T2, 2);
         snap(end).Tmax_r = max(T2, [], 2);
     end
@@ -177,179 +237,392 @@ for step = 0:nsteps
         break;
     end
 
-    % ---- burn state + gas temp ----
-    isBurning = (t < burn.t_burn + 1e-12);
 
-    if isBurning
-        T_gas = BC.T_gas;
-    else
-        tau_gas = 20;  % [s] tune to test data
-        T_gas = BC.T_amb + (BC.T_gas - BC.T_amb) * exp(-(t - burn.t_burn)/tau_gas);
-    end
+    %% New Func
+    [isBurning,T_gas,ndel,willDelete,willDel_hist,Lg,grain_present,n_grain] = compute_step_state(step, t, T, r_centers, dz, burn, geom, BC, cfg);
 
-    % Decide deletion NOW (needed for diagnostics and for later deletion)
-    willDelete = isBurning && ~isempty(layer_idx_of_ring) && (layer_idx_of_ring(1) == 1);
-    willDel_hist(step+1) = willDelete;
+    % if mod(step, cfg.status_every) == 0
+    %     fprintf('Lg = %.4f m | grain slices = %d / %d\n', Lg, n_grain, Nz);
+    % end
 
-
-    % ---- assemble + solve ----
+    % ---- assemble + solve (cached base matrix; per-step BC updates) ----
     Tprev = T;
     t_start_step = tic;
 
+    Tcap0_prev = Tcap0;
+    TcapL_prev = TcapL;
+
+    Nr     = numel(r_centers);
+    Ntheta = size(Tprev,2);
+    Nz     = size(Tprev,3);
+    Nwall  = Nr*Ntheta*Nz;
+
+
+    % Build cache once (or rebuild after any deletion that changes Nr / r_faces / r_centers)
+    if ~exist('cache3D','var') || isempty(cache3D) || cache3D.Nr ~= numel(r_centers) ...
+            || cache3D.Ntheta ~= size(Tprev,2) || cache3D.Nz ~= size(Tprev,3)
+        cache3D = build_BE_polar3D_cache( ...
+            r_faces, r_centers, dtheta, dz, ...
+            k_ring, rhoCp_ring, time.dt, cfg, Lg, size(Tprev,2), size(Tprev,3));
+    end
+
     t_asm = tic;
-    [A, b] = assemble_BE_polar_3D( ...
-        Tprev, Tcap0, TcapL, r_faces, r_centers, dtheta, dz, ...
-        k_ring, rhoCp_ring, time.dt, ...
-        BC, isBurning, T_gas, cfg);
+
+    [A, b] = assemble_from_cache_BE_polar3D( ...
+        cache3D, Tprev, Tcap0_prev, TcapL_prev, BC, T_gas, cfg, Lg);
     asm_time = toc(t_asm);
 
     t_solve = tic;
-    Tvec = A \ b;
-    solve_time = toc(t_solve);
-
-    Nwall = Nr * Ntheta * Nz;
-
-    % Wall temperatures live in the first Nwall entries
-    T = reshape(Tvec(1:Nwall), [Nr, Ntheta, Nz]);
-
-    % Extract endcap temperatures (if present)
+    % ---- endcap presence flags (must exist before pack_state_vec) ----
+    cap_z0 = false;
+    cap_zL = false;
+    
     if isfield(cfg,'endcap') && isfield(cfg.endcap,'enable') && cfg.endcap.enable
         if ~isfield(cfg.endcap,'ends'); cfg.endcap.ends = 'both'; end
-
-        if strcmpi(cfg.endcap.ends,'both')
-            Tcap0 = Tvec(Nwall + 1);
-            TcapL = Tvec(Nwall + 2);
-
-        elseif strcmpi(cfg.endcap.ends,'z0')
-            Tcap0 = Tvec(Nwall + 1);
-            TcapL = [];
-
-        elseif strcmpi(cfg.endcap.ends,'zL')
-            Tcap0 = [];
-            TcapL = Tvec(Nwall + 1);
-        end
+    
+        cap_z0 = strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'z0');
+        cap_zL = strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'zL');
     end
 
 
-    % Extract endcap temperatures (if present)
-    if isfield(cfg,'endcap') && isfield(cfg.endcap,'enable') && cfg.endcap.enable
-        Nwall = Nr*Ntheta*Nz;
-        if strcmpi(cfg.endcap.ends,'both')
-            Tcap0 = Tvec(Nwall+1);
-            TcapL = Tvec(Nwall+2);
-        elseif strcmpi(cfg.endcap.ends,'z0')
-            Tcap0 = Tvec(Nwall+1);
-            TcapL = [];
-        elseif strcmpi(cfg.endcap.ends,'zL')
-            Tcap0 = [];
-            TcapL = Tvec(Nwall+1);
+    %% =========================
+    % Solve with rails: iterative with checks + retry + direct fallback
+    %% =========================
+
+    % --- Ensure cfg.solve exists ---
+    if ~isfield(cfg,'solve'); cfg.solve = struct(); end
+
+    % --- Diagnostic mode flag controls solver strictness ---
+    diagMode = false;
+    if isfield(cfg,'doEnergyDiagnostics') && cfg.doEnergyDiagnostics
+        diagMode = true;
+    end
+
+
+    % Defaults (you can tune)
+    if ~isfield(cfg.solve,'tol_diag');    cfg.solve.tol_diag = 1e-12; end
+    if ~isfield(cfg.solve,'tol_prod');    cfg.solve.tol_prod = 1e-8;  end
+    if ~isfield(cfg.solve,'maxit_diag');  cfg.solve.maxit_diag = 400; end
+    if ~isfield(cfg.solve,'maxit_prod');  cfg.solve.maxit_prod = 200; end
+
+    if ~isfield(cfg.solve,'sys_resid_max_diag'); cfg.solve.sys_resid_max_diag = 1e-11; end
+    if ~isfield(cfg.solve,'sys_resid_max_prod'); cfg.solve.sys_resid_max_prod = 1e-8;  end
+
+    tol   = diagMode * cfg.solve.tol_diag   + (~diagMode) * cfg.solve.tol_prod;
+    maxit = diagMode * cfg.solve.maxit_diag + (~diagMode) * cfg.solve.maxit_prod;
+    sys_resid_max = diagMode * cfg.solve.sys_resid_max_diag + (~diagMode) * cfg.solve.sys_resid_max_prod;
+
+    % --- Warm start vector ---
+    x0 = pack_state_vec(Tprev, cap_z0, cap_zL, Tcap0_prev, TcapL_prev);
+
+    % --- Decide if we must rebuild preconditioner ---
+    N = size(A,1);
+    needPrec = true;
+    if isfield(cache3D,'precN') && cache3D.precN == N
+        needPrec = false;
+    end
+    if exist('didDeleteThisStep','var') && didDeleteThisStep
+        needPrec = true;
+    end
+    if ~isfield(cache3D,'precRefreshEvery'); cache3D.precRefreshEvery = 50; end
+    if ~isfield(cache3D,'stepCount'); cache3D.stepCount = 0; end
+    cache3D.stepCount = cache3D.stepCount + 1;
+    if mod(cache3D.stepCount, cache3D.precRefreshEvery) == 0
+        needPrec = true;
+    end
+
+    % --- Build preconditioner if needed ---
+    if needPrec
+        if ~isfield(cfg.solve,'ichol_droptol');   cfg.solve.ichol_droptol = 1e-3; end
+        if ~isfield(cfg.solve,'ichol_diagcomp');  cfg.solve.ichol_diagcomp = 1e-3; end
+        if ~isfield(cfg.solve,'ilu_droptol');     cfg.solve.ilu_droptol = 1e-3; end
+
+        cache3D.precOK = false;
+        try
+            cache3D.M = ichol(A, struct('type','ict', ...
+                'droptol', cfg.solve.ichol_droptol, ...
+                'diagcomp', cfg.solve.ichol_diagcomp));
+            cache3D.Mt = cache3D.M';
+            cache3D.precOK = true;
+        catch
+            setup = struct('type','ilutp','droptol',cfg.solve.ilu_droptol);
+            [cache3D.L, cache3D.U] = ilu(A, setup);
+            cache3D.precOK = false; % gmres path
+        end
+        cache3D.precN = N;
+    end
+
+    % --- Solve with rails (retry tightening then direct fallback) ---
+    Tvec = [];
+    solverName = '';
+    flag = 0; relres = NaN; iters = [];
+
+    for attempt = 1:3
+        if isfield(cache3D,'precOK') && cache3D.precOK
+            solverName = 'pcg';
+            [Tvec, flag, relres, iters] = pcg(A, b, tol, maxit, cache3D.M, cache3D.Mt, x0);
+        else
+            solverName = 'gmres';
+            restart = 50;
+            [Tvec, flag, relres, iters] = gmres(A, b, restart, tol, maxit, cache3D.L, cache3D.U, x0);
+        end
+
+        % System residual check
+        denom = max(norm(b), 1.0);
+        sys_resid = norm(A*Tvec - b) / denom;
+
+        % Accept if both iterative convergence and system residual are good
+        if (flag == 0) && (sys_resid <= sys_resid_max)
+            break;
+        end
+
+        % If not accepted, tighten and retry
+        tol = tol * 0.1;
+        maxit = maxit * 2;
+
+        % On the second failure, force a preconditioner refresh next time
+        if attempt == 2
+            needPrec = true;
+            cache3D.precN = -1; % guarantees rebuild on next step if you keep logic
         end
     end
+
+    % Final safety fallback: direct solve if still not acceptable
+    denom = max(norm(b), 1.0);
+    sys_resid = norm(A*Tvec - b) / denom;
+    if ~(flag == 0 && sys_resid <= sys_resid_max)
+        if diagMode
+            warning('Iterative solve not accepted (flag=%d, sys_resid=%.3g, relres=%.3g). Falling back to direct A\\b.', ...
+                flag, sys_resid, relres);
+        end
+        solverName = 'direct';
+        Tvec = A \ b;
+        sys_resid = norm(A*Tvec - b) / denom;
+    end
+
+    solve_time = toc(t_solve);
+
+    % Unpack solution ONCE (no duplicate reshapes)
+    [T, Tcap0, TcapL] = unpack_state_vec(Tvec, Nr, Ntheta, Nz, cap_z0, cap_zL);
+
+    % Optional system residual check (cheap-ish; keep gated)
+    if isfield(cfg,'diag') && isfield(cfg.diag,'consistency') && cfg.diag.consistency ...
+            && mod(step, cfg.status_every) == 0
+        sys_resid = norm(A*Tvec - b) / max(norm(b),1);
+    end
+
+    % ---- step time so far ----
     step_time = toc(t_start_step);
 
-    % =========================
-    % Boundary heat (consistent with assembler: uses Tprev for rad linearization)
-    % =========================
-    dQ_in  = 0.0;   % positive INTO solid
-    dQ_out = 0.0;   % positive LEAVING solid
+    %% =========================
+    % Ab-implied energy and heat diagnostic (pre-deletion)
+    %% =========================
+    % Mdiag should be cacheable, but keep as-is for now (you can cache later)
+    Mdiag = build_Mdiag_wall_endcap(r_faces, r_centers, dtheta, dz, rhoCp_ring, time.dt, cfg);
 
-    % Inner/outer areas per cell use dz (not cfg.L), because we explicitly resolve Nz slices.
+    Tprev_vec = Tprev(:);
+    if isfield(cfg,'endcap') && isfield(cfg.endcap,'enable') && cfg.endcap.enable
+        if ~isfield(cfg.endcap,'ends'); cfg.endcap.ends = 'both'; end
+        if strcmpi(cfg.endcap.ends,'both')
+            Tprev_vec = [Tprev_vec; Tcap0_prev; TcapL_prev];
+        elseif strcmpi(cfg.endcap.ends,'z0')
+            Tprev_vec = [Tprev_vec; Tcap0_prev];
+        elseif strcmpi(cfg.endcap.ends,'zL')
+            Tprev_vec = [Tprev_vec; TcapL_prev];
+        end
+    end
+
+    diagAb = energy_diag_from_Ab(A, b, Tvec, Tprev_vec, Mdiag, time.dt, Nwall);
+
+    dQimplied_hist(step+1)      = diagAb.dQ_implied_total;
+    dQimplied_wall_hist(step+1) = diagAb.dQ_implied_wall;
+    dQimplied_cap_hist(step+1)  = diagAb.dQ_implied_cap;
+    dEimplied_hist(step+1)      = diagAb.dE_mass_total;
+    residAb_hist(step+1)        = diagAb.resid_total;
+
+    %% =========================
+    % Boundary heat diagnostics  (kept aligned with your existing logic)
+    %% =========================
+    dQ_in_unmasked_Tnew  = 0.0;
+    dQ_in_unmasked_Tprev = 0.0;
+
+    dQ_in_unmasked  = 0.0;
+    dQ_in_masked    = 0.0;
+    dQ_out          = 0.0;   % positive leaving solid
+
+    zmask_net = grain_present(:);   %#ok<NASGU>
+
+    qface_inner_net      = zeros(Ntheta, Nz);  %#ok<NASGU>
+    qface_inner_unmasked = zeros(Ntheta, Nz);  %#ok<NASGU>
+
+    n_inGrain_count = 0;
+
     for kk = 1:Nz
+        inGrain = grain_present(kk);
+        n_inGrain_count = n_inGrain_count + double(inGrain);
+
+        if ~isempty(m_in)
+            m = m_in(kk);
+        else
+            m = 1.0;
+        end
+
         for j = 1:Ntheta
-            % ---------- INNER boundary (i=1) ----------
+            % INNER boundary (i=1)
             Tw0 = Tprev(1,j,kk);
             [h_eff, q_const] = rad_lin_coeff(BC.eps_in, BC.sigma, Tw0, T_gas);
-            h_total = BC.h_in + h_eff;
+            h_base = (BC.h_in + h_eff);
 
-            Aface_in = r_faces(1) * dtheta * dz;   % area of inner radial face for this (theta,z) cell
-            dQ_in = dQ_in + time.dt * ( h_total*Aface_in*(T_gas - T(1,j,kk)) + q_const*Aface_in );
+            Aface_in = r_faces(1) * dtheta * dz;
 
-            % ---------- OUTER boundary (i=Nr) ----------
-            Tw0 = Tprev(Nr,j,kk);
-            [h_eff, q_const] = rad_lin_coeff(BC.eps_out, BC.sigma, Tw0, BC.T_amb);
-            h_total = BC.h_out + h_eff;
+            dQ_face_in_Tnew  = time.dt * ( h_base*Aface_in*(T_gas - T(1,j,kk))      + q_const*Aface_in );
+            dQ_face_in_Tprev = time.dt * ( h_base*Aface_in*(T_gas - Tprev(1,j,kk)) + q_const*Aface_in );
 
-            Aface_out = r_faces(end) * dtheta * dz; % outer radial face at r_{Nr+1/2}
-            dQ_into_solid_outer = time.dt * ( h_total*Aface_out*(BC.T_amb - T(Nr,j,kk)) + q_const*Aface_out );
+            dQ_in_unmasked_Tnew  = dQ_in_unmasked_Tnew  + dQ_face_in_Tnew;
+            dQ_in_unmasked_Tprev = dQ_in_unmasked_Tprev + dQ_face_in_Tprev;
 
-            % bookkeeping: define dQ_out as positive LEAVING solid
+            dQ_in_unmasked = dQ_in_unmasked + dQ_face_in_Tnew;
+            qface_inner_unmasked(j,kk) = dQ_face_in_Tnew;
+
+            if inGrain
+                h_total = m * h_base;
+                dQ_face_in_masked = time.dt * ( h_total*Aface_in*(T_gas - T(1,j,kk)) + q_const*Aface_in );
+                dQ_in_masked = dQ_in_masked + dQ_face_in_masked;
+                qface_inner_net(j,kk) = dQ_face_in_masked;
+            else
+                qface_inner_net(j,kk) = 0.0;
+            end
+
+            % OUTER boundary (i=Nr)
+            Tw1 = Tprev(Nr,j,kk);
+            [h_eff_o, q_const_o] = rad_lin_coeff(BC.eps_out, BC.sigma, Tw1, BC.T_amb);
+            h_total_o = BC.h_out + h_eff_o;
+
+            Aface_out = r_faces(end) * dtheta * dz;
+            dQ_into_solid_outer = time.dt * ( h_total_o*Aface_out*(BC.T_amb - T(Nr,j,kk)) + q_const_o*Aface_out );
+
+            % dQ_out positive leaving solid
             dQ_out = dQ_out - dQ_into_solid_outer;
         end
     end
 
-    dQnet = dQ_in - dQ_out;
+    dQnet_masked   = dQ_in_masked   - dQ_out;
+    dQnet_unmasked = dQ_in_unmasked - dQ_out;
 
+    dqnet_Tnew  = dQ_in_unmasked_Tnew  - dQ_out;
+    dqnet_Tprev = dQ_in_unmasked_Tprev - dQ_out;
 
-    % ---- Energy balance for this step (BEFORE deleting rings) ----
-    % --- Energies computed on the same domain as the solve (pre-deletion) ---
-    E_prev = E_solid_hist(step+1);  % energy of the carried state at start of this step
-    E_new  = solid_internal_energy(T, r_faces, dtheta, dz, rhoCp_ring);
+    dQnet_masked_hist(step+1)   = dQnet_masked;
+    dQnet_unmasked_hist(step+1) = dQnet_unmasked;
+    dqnet_Tnew_hist(step+1)     = dqnet_Tnew;
+    dqnet_Tprev_hist(step+1)    = dqnet_Tprev;
 
-    % Energy that leaves the computational domain if we delete ring 1 AFTER the solve
-    E_removed = 0.0;
+    % Use Ab-implied heat for closure while diagnosing, as you chose
+    dQnet = diagAb.dQ_implied_total;
+
+    %% =========================
+    % Energy balance for this step (pre-deletion state)
+    %% =========================
+    E_prev = E_solid_hist(step+1);
+
+    E_wall_new = solid_internal_energy(T, r_faces, dtheta, dz, rhoCp_ring);
+    E_cap_new  = endcap_internal_energy(Tcap0, TcapL, r_faces, cfg, BC);
+    E_new      = E_wall_new + E_cap_new;
+
+    % Store pre-deletion new energy first
+    E_solid_hist(step+2) = E_new;
+
+    %% =========================
+    % Energy removed if we delete ndel rings after solve
+    %% =========================
+    E_removed_wall = 0.0;
+
     if willDelete
-        r_imh = r_faces(1);
-        r_iph = r_faces(2);
-        Vcell = 0.5*(r_iph^2 - r_imh^2) * dtheta * dz;   % per-(theta,z)-cell volume
-        E_removed = rhoCp_ring(1) * Vcell * sum(T(1,:,:),'all');    % sum over theta
+        for ii = 1:ndel
+            r_imh = r_faces(ii);
+            r_iph = r_faces(ii+1);
+            Vcell = 0.5*(r_iph^2 - r_imh^2) * dtheta * dz;
+            T_ring = squeeze(T(ii,:,:));
+            E_removed_wall = E_removed_wall + rhoCp_ring(ii) * Vcell * sum(T_ring(:));
+        end
     end
 
-    % Corrected energy change over the step for a moving/deleting domain
+    Erem_hist(step+1) = E_removed_wall;
+
+    E_removed_cap = 0.0;
+    if willDelete && isfield(cfg,'endcap') && isfield(cfg.endcap,'enable') && cfg.endcap.enable
+        if ~isfield(cfg.endcap,'ends'); cfg.endcap.ends = 'both'; end
+
+        rhoCp_cap = cfg.endcap.rho * cfg.endcap.cp;
+
+        r_outer = r_faces(end);
+        r_inner_before = r_faces(1);
+        r_inner_after  = r_faces(ndel+1);
+
+        A_before = pi * (r_outer^2 - r_inner_before^2);
+        A_after  = pi * (r_outer^2 - r_inner_after^2);
+        dV = (A_before - A_after) * cfg.endcap.thickness;
+
+        if dV > 0
+            if strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'z0')
+                if ~isempty(Tcap0)
+                    E_removed_cap = E_removed_cap + rhoCp_cap * dV * Tcap0;
+                end
+            end
+            if strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'zL')
+                if ~isempty(TcapL)
+                    E_removed_cap = E_removed_cap + rhoCp_cap * dV * TcapL;
+                end
+            end
+        end
+    end
+
+    E_removed_total = E_removed_wall + E_removed_cap;
+
+    %% =========================
+    % Closure defined on the solved domain (pre-deletion)
+    %% =========================
     dE_corr = (E_new - E_prev);
-
-    % --- IMPORTANT: store the energy of the state that will be carried into the NEXT step ---
-    if willDelete
-        E_solid_hist(step+2) = E_new - E_removed;   % energy AFTER deletion (matches T after you delete)
-    else
-        E_solid_hist(step+2) = E_new;
-    end
-
     closure = dE_corr - dQnet;
 
-    % relative error with stable scaling
-    Qscale = max(abs(dQ_in) + abs(dQ_out), 1.0);
+    Qscale = max(abs(dQ_in_masked) + abs(dQ_out), 1.0);
     relerr = closure / Qscale;
 
-    % store energy histories
-    dE_hist(step+1)      = dE_corr;
-    dQnet_hist(step+1)   = dQnet;
-    closure_hist(step+1) = closure;
-    relerr_hist(step+1)  = relerr;
+    dE_hist(step+1)     = dE_corr;
+    dQnet_hist(step+1)  = dQnet;
+    relerr_hist(step+1) = relerr;
 
-    % ---- NEW diagnostic: Qcond12 computed directly from matrix coupling (optional but useful) ----
-    % This is not used to "fix" anything yet; it is for pinpointing.
+    closure_pre_hist(step+1) = closure;
+
+    %% =========================
+    % Optional diagnostic: conduction across the DELETION INTERFACE from A
+    %% =========================
     Qcond12_fromA = NaN;
 
-    % Only meaningful if you are about to delete ring 1
-    if willDelete && Nr >= 2
-        % We want the conduction flow between ring 2 and ring 1:
-        % Q = dt * sum_over_theta,z( G12 * (T2 - T1) )
-        %
-        % For BE matrix, the coupling entry A(p1,p2) is -G12 (for that cell),
-        % so G12 = -A(p1,p2).
+    if willDelete
+        i_del  = ndel;
+        i_keep = ndel + 1;
 
-        % Build indices for all (j,kk) pairs
-        [Jgrid, Kgrid] = ndgrid(1:Ntheta, 1:Nz);
-        Jlist = Jgrid(:);
-        Klist = Kgrid(:);
+        if i_del >= 1 && i_keep <= Nr
+            [Jgrid, Kgrid] = ndgrid(1:Ntheta, 1:Nz);
+            Jlist = Jgrid(:);
+            Klist = Kgrid(:);
 
-        p1 = sub2ind([Nr, Ntheta, Nz], ones(size(Jlist)), Jlist, Klist);   % (i=1, j, k)
-        p2 = sub2ind([Nr, Ntheta, Nz], 2*ones(size(Jlist)), Jlist, Klist); % (i=2, j, k)
+            p_del  = sub2ind([Nr, Ntheta, Nz], i_del *ones(size(Jlist)),  Jlist, Klist);
+            p_keep = sub2ind([Nr, Ntheta, Nz], i_keep*ones(size(Jlist)),  Jlist, Klist);
 
-        % Extract the coupling coefficients A(p1,p2)
-        lin = sub2ind(size(A), p1, p2);
-        G12 = full(-A(lin));   % length = Ntheta*Nz
+            lin = sub2ind(size(A), p_del, p_keep);
+            Gface = full(-A(lin));
 
-        % Temperature difference (T2 - T1) for those same cells
-        dT12 = reshape(T(2,:,:) - T(1,:,:), [], 1);  % length = Ntheta*Nz
+            dT = reshape(T(i_del,:,:) - T(i_keep,:,:), [], 1);
 
-        Qcond12_fromA = time.dt * sum(G12 .* dT12);
+            Qcond12_fromA = time.dt * sum(Gface .* dT);
+        end
     end
 
     Qcond12A_hist(step+1) = Qcond12_fromA;
 
-
-    % ---- status output ----
+    %% ---- status output ----
     if mod(step, cfg.status_every) == 0 || step == 1
         Tmax_now = max(T(:));
         Tmin_now = min(T(:));
@@ -368,50 +641,85 @@ for step = 0:nsteps
             'T_out,max = %6.1f K | ' ...
             'asm = %.2fs | solve = %.2fs | total = %.2fs\n'], ...
             step, nsteps, t, burn_msg, ...
-            Nr, Ntheta, Nr*Ntheta, ...
+            Nr, Ntheta, Nr*Ntheta*Nz, ...
             Tmin_now, Tmax_now, Tout_max_now, ...
             asm_time, solve_time, step_time);
 
         if step_time > cfg.time_warn
-            fprintf('   ⚠ step time exceeded %.1f s\n', cfg.time_warn);
+            fprintf('   step time exceeded %.1f s\n', cfg.time_warn);
         end
     end
 
-    if mod(step, cfg.status_every) == 0
-        fprintf('Progress: %5.1f %%\n', 100*step/nsteps);
-    end
-
-    % ---- Move burn front by deleting first radial ring while still in propellant ----
+    %% =========================
+    % Deletion happens after diagnostics, then set carried energy correctly
+    %% =========================
     if willDelete
-        T(1,:,:) = [];
-        r_centers(1) = [];
-        r_faces(1) = [];
-        layer_idx_of_ring(1) = [];
+        Nr_before = numel(r_centers);
 
-        Nr = numel(r_centers);
+        % perform deletion on the solved temperature field
+        T(1:ndel,:,:)             = [];
+        r_centers(1:ndel)         = [];
+        r_faces(1:ndel)           = [];
+        layer_idx_of_ring(1:ndel) = [];
+
+        Nr_after = numel(r_centers);
+        if Nr_after ~= (Nr_before - ndel)
+            error('Nr observed mismatch: before=%d after=%d ndel=%d', Nr_before, Nr_after, ndel);
+        end
+
+        % Update per-ring properties after deletion
         [k_ring, rhoCp_ring] = ring_props(layers, layer_idx_of_ring);
+
+        % Energies after deletion
+        E_afterDel_wall = solid_internal_energy(T, r_faces, dtheta, dz, rhoCp_ring);
+        E_afterDel_cap  = endcap_internal_energy(Tcap0, TcapL, r_faces, cfg, BC);
+        E_afterDel      = E_afterDel_wall + E_afterDel_cap;
+
+        % Overwrite carried energy with post-deletion energy (this is crucial)
+        E_solid_hist(step+2) = E_afterDel;
+
+        Qdel = E_removed_total;
+        Qdel_hist(step+1) = Qdel;
+
+        R_post = (E_afterDel - E_prev) - dQnet + Qdel;
+        closure_post_hist(step+1) = R_post;
+        closure_hist(step+1)      = R_post;
+
+    else
+        Qdel_hist(step+1) = 0.0;
+        closure_post_hist(step+1) = closure_pre_hist(step+1);
+        closure_hist(step+1)      = closure_pre_hist(step+1);
     end
+
 
 end
 
-plot_results(snap, layers, geom, burn, BC);
+%% Final axial profiles
+z_centers = ((1:cfg.Nz) - 0.5) * dz;
+Tin_z = squeeze(mean(T(1,:,:), 2));
+Tout_z = squeeze(mean(T(end,:,:), 2));
 
-%% ==================== 3D tube animation (outer surface) ====================
-% Requires: Tout3D_store (Ntheta x Nz x Nt_store), t_store, theta_centers, z_centers, r_faces
+figure;
+plot(z_centers, Tin_z, 'LineWidth', 2); hold on;
+plot(z_centers, Tout_z, 'LineWidth', 2);
+grid on;
+xlabel('z [m]');
+ylabel('Temperature [K]');
+legend('Inner wall (mean over \theta)','Outer wall (mean over \theta)','Location','best');
+title('Axial temperature profiles at final time');
+
+plot_results(snap, layers, geom, burn, BC);
+fprintf('Maximum Outer Wall Temperature %f at %f seconds\n', max(TbarMat), find(TbarMat))
 
 %% ==================== 3D tube animation + GIF export (outer surface) ====================
-% Requires: Tout3D_store (Ntheta x Nz x Nt_store), t_store, theta_centers, r_faces
-
 if exist('Tout3D_store','var') && ~isempty(Tout3D_store)
     r_outer = r_faces(end);
     z_centers = ((1:cfg.Nz) - 0.5) * (cfg.L / cfg.Nz);
 
-    % Build cylinder surface grid
     [TH, ZZ] = meshgrid(theta_centers, z_centers);
     XX = r_outer * cos(TH);
     YY = r_outer * sin(TH);
 
-    % Initial color data
     C0 = Tout3D_store(:,:,1).';   % [Nz x Ntheta]
 
     fig = figure('Name','3D Outer Surface Temperature', 'Color','w');
@@ -423,52 +731,45 @@ if exist('Tout3D_store','var') && ~isempty(Tout3D_store)
     view(35, 20);
     camlight headlight; lighting gouraud;
 
-    % Fix color scaling for entire animation
     Tmin = min(Tout3D_store, [], 'all');
     Tmax = max(Tout3D_store, [], 'all');
     caxis([Tmin Tmax]);
 
-    % Frame limits (protect against mismatch)
     NtT = size(Tout3D_store, 3);
     Ntt = numel(t_store);
     Nt  = min(NtT, Ntt);
 
-    % GIF settings
     gifname = 'outer_wall_temperature.gif';
-    gif_dt  = 0.05;   % seconds per frame (20 FPS)
+    gif_dt  = 0.05;
 
-    % --------- Animation + GIF write ---------
     for kk = 1:Nt
         Ck = Tout3D_store(:,:,kk).';
         set(h, 'CData', Ck);
         title(sprintf('Outer wall T, t = %.2f s', t_store(kk)));
         drawnow;
 
-        % Capture frame
         frame = getframe(fig);
         im = frame2im(frame);
         [imind, cm] = rgb2ind(im, 256);
 
         if kk == 1
-            imwrite(imind, cm, gifname, 'gif', ...
-                'Loopcount', inf, 'DelayTime', gif_dt);
+            imwrite(imind, cm, gifname, 'gif', 'Loopcount', inf, 'DelayTime', gif_dt);
         else
-            imwrite(imind, cm, gifname, 'gif', ...
-                'WriteMode', 'append', 'DelayTime', gif_dt);
+            imwrite(imind, cm, gifname, 'gif', 'WriteMode', 'append', 'DelayTime', gif_dt);
         end
     end
 
     fprintf('GIF written to %s (%d frames)\n', gifname, Nt);
-
 else
     warning('Tout3D_store not found or empty. Add the store block inside the sim loop first.');
 end
 
-
-
-
+%% Energy diagnostic plots
 if isfield(cfg,'doEnergyDiagnostics') && cfg.doEnergyDiagnostics
-    plot_energy_diagnostics(time, closure_hist, relerr_hist, willDel_hist, Qcond12A_hist, cfg);
+    cfg2 = cfg;
+
+    cfg2.diagLabel = 'POST (after deletion correction)';
+    plot_energy_diagnostics(time, closure_post_hist, relerr_hist, willDel_hist, Qcond12A_hist, cfg2);
 end
 
 end
@@ -556,29 +857,83 @@ end
 end
 
 function [A, b] = assemble_BE_polar_3D(Tprev, Tcap0_prev, TcapL_prev, r_faces, r_centers, dtheta, dz, ...
-    k_ring, rhoCp_ring, dt, BC, ~, T_gas, cfg)
-% Assemble sparse Backward Euler FV system for 3D polar conduction (r,theta,z) with optional lumped endcaps.
+    k_ring, rhoCp_ring, dt, BC, ~, T_gas, cfg, Lg)
+%ASSEMBLE_BE_POLAR_3D Backward Euler FV for 3D polar conduction (r,theta,z) with optional lumped endcaps.
 % Unknown ordering for wall cells: p = sub2ind([Nr, Ntheta, Nz], i, j, k)
-% Optional endcap nodes (lumped):
-%   If enabled, extra unknown(s) appended after wall cells: [Tcap0; TcapL] depending on cfg.endcap.ends.
+% Optional endcap nodes appended after wall cells: [Tcap0; TcapL] depending on cfg.endcap.ends.
+%
+% Step 1 integration: optionally disable hot-gas convection/radiation on an endcap inner face
+% via cfg.endcap.gas_exposed_z0 and cfg.endcap.gas_exposed_zL (true/false).
 
-Nr = numel(r_centers);
+Nr     = numel(r_centers);
 Ntheta = size(Tprev,2);
-Nz = size(Tprev,3);
-Nwall = Nr * Ntheta * Nz;
+Nz     = size(Tprev,3);
+Nwall  = Nr * Ntheta * Nz;
 
 useEndcap = isfield(cfg,'endcap') && isfield(cfg.endcap,'enable') && cfg.endcap.enable;
-cap_z0 = false; cap_zL = false;
+
+% ---- Step 4: compute throat-area proxy scaling for cavity convection ----
+useNozProxy = isfield(cfg,'noz') && isfield(cfg.noz,'enableProxy') && cfg.noz.enableProxy;
+
+% ---- Step 4: throat-area proxy scaling needs port area ----
+r_inner = r_faces(1);           % current inner radius (after deletion)
+Aport   = pi * r_inner^2;       % current port cross-sectional area
+
+
+r_t = [];
+At  = [];
+if useNozProxy
+    r_t = cfg.noz.r_t;
+    At  = pi * r_t^2;                 % throat area
+end
+
+% For cavity-side "reference area", use current port cross-section area
+Aport = pi * r_inner^2;               % uses current inner radius (after deletion)
+
+
+% ---- Axial grain-present mask (grain shrinks from z=L backward) ----
+z_centers = ((1:Nz) - 0.5) * dz;
+
+% ---- Step 2: inner-wall insulation multiplier along z (default 1 everywhere) ----
+m_in = ones(Nz,1);
+
+useWallInsul = isfield(cfg,'wall_insul') && isfield(cfg.wall_insul,'enable') && cfg.wall_insul.enable;
+if useWallInsul
+    if ~isfield(cfg.wall_insul,'end');    cfg.wall_insul.end = 'z0'; end
+    if ~isfield(cfg.wall_insul,'length'); cfg.wall_insul.length = 0.0; end
+    if ~isfield(cfg.wall_insul,'factor'); cfg.wall_insul.factor = 0.0; end
+
+    if strcmpi(cfg.wall_insul.end,'z0')
+        mask = (z_centers <= cfg.wall_insul.length);
+    elseif strcmpi(cfg.wall_insul.end,'zL')
+        mask = (z_centers >= (max(z_centers) - cfg.wall_insul.length));
+    else
+        error('cfg.wall_insul.end must be ''z0'' or ''zL''.');
+    end
+
+    m_in(mask) = cfg.wall_insul.factor;
+end
+
+% Grain occupies 0 <= z <= Lg. Aft cavity is z > Lg.
+grain_present = (z_centers <= Lg + 1e-12);
+
+cap_z0 = false;
+cap_zL = false;
 if useEndcap
     if ~isfield(cfg.endcap,'ends'); cfg.endcap.ends = 'both'; end
     cap_z0 = strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'z0');
     cap_zL = strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'zL');
 end
 Ncap = double(cap_z0) + double(cap_zL);
+N    = Nwall + Ncap;
 
-N = Nwall + Ncap;
+% Per-end gas exposure flags (defaults true)
+gas_exposed_z0 = true;
+gas_exposed_zL = true;
+if useEndcap && isfield(cfg.endcap,'gas_exposed_z0'); gas_exposed_z0 = cfg.endcap.gas_exposed_z0; end
+if useEndcap && isfield(cfg.endcap,'gas_exposed_zL'); gas_exposed_zL = cfg.endcap.gas_exposed_zL; end
 
-% Preallocate sparse
+% Preallocate sparse triplets
 nz_est = N * 14;
 I = zeros(nz_est,1);
 J = zeros(nz_est,1);
@@ -586,7 +941,7 @@ V = zeros(nz_est,1);
 b = zeros(N,1);
 idx = 0;
 
-% Convenience: periodic theta indexing
+% Periodic theta indexing
 jp = @(j) (j < Ntheta) * (j+1) + (j==Ntheta) * 1;
 jm = @(j) (j > 1)     * (j-1) + (j==1)     * Ntheta;
 
@@ -600,84 +955,89 @@ if cap_zL
     p_capL = Nwall + 1 + double(cap_z0);
 end
 
-% Annulus area for endcap coupling and convection/radiation (matches the wall domain)
-r_inner = r_faces(1);
-r_outer = r_faces(end);
-A_annulus = pi * (r_outer^2 - r_inner^2);     % [m^2]
+% Annulus area for endcap convection/radiation (matches wall domain)
+r_inner   = r_faces(1);
+r_outer   = r_faces(end);
+A_annulus = pi * (r_outer^2 - r_inner^2);  % [m^2]
 
-% Endcap thermal mass
+% Convenience: pull endcap parameters once (no repeated isfield inside loops)
 if useEndcap
     if ~isfield(cfg.endcap,'thickness'); cfg.endcap.thickness = dz; end
-    if ~isfield(cfg.endcap,'k');  cfg.endcap.k  = 1.0; end
-    if ~isfield(cfg.endcap,'rho'); cfg.endcap.rho = 1000; end
-    if ~isfield(cfg.endcap,'cp');  cfg.endcap.cp  = 1000; end
+    if ~isfield(cfg.endcap,'k');         cfg.endcap.k         = 1.0; end
+    if ~isfield(cfg.endcap,'rho');       cfg.endcap.rho       = 1000; end
+    if ~isfield(cfg.endcap,'cp');        cfg.endcap.cp        = 1000; end
+    if ~isfield(cfg.endcap,'h_in');      cfg.endcap.h_in      = 0; end
+    if ~isfield(cfg.endcap,'eps_in');    cfg.endcap.eps_in    = 0; end
+    if ~isfield(cfg.endcap,'h_out');     cfg.endcap.h_out     = 0; end
+    if ~isfield(cfg.endcap,'eps_out');   cfg.endcap.eps_out   = 0; end
+end
+
+% Assemble endcap node equations (lumped) if enabled
+if useEndcap
     rhoCp_cap = cfg.endcap.rho * cfg.endcap.cp;
+    Vcap      = A_annulus * cfg.endcap.thickness;  % [m^3]
+    aPcap     = rhoCp_cap * Vcap / dt;             % [W/K] in BE form
 
-    Vcap = A_annulus * cfg.endcap.thickness;  % [m^3]
-    aPcap = rhoCp_cap * Vcap / dt;            % [W/K] in BE form
-
-    % Helper to assemble a single endcap node equation
-
-    % Assemble endcap node equations (lumped) if enabled
     if cap_z0
-        pcap = p_cap0; Tcap_prev = Tcap0_prev;
-        % transient term
-        idx = idx + 1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + aPcap;
+        pcap     = p_cap0;
+        Tcap_prev = Tcap0_prev;
+
+        % transient
+        idx=idx+1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + aPcap;
         b(pcap) = b(pcap) + aPcap * Tcap_prev;
 
-        % inside (to gas) convection+radiation
-        if ~isfield(cfg.endcap,'h_in'); cfg.endcap.h_in = 0; end
-        if ~isfield(cfg.endcap,'eps_in'); cfg.endcap.eps_in = 0; end
-        Tw0 = Tcap_prev;
-        [h_rad_in, q_const_in] = rad_lin_coeff(cfg.endcap.eps_in, BC.sigma, Tw0, T_gas);
-        htot_in = cfg.endcap.h_in + h_rad_in;
-        if htot_in > 0
-            idx = idx + 1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + htot_in*A_annulus;
-            b(pcap) = b(pcap) + htot_in*A_annulus*T_gas + q_const_in*A_annulus;
+        % inside (to gas): only if gas reaches this end
+        if gas_exposed_z0
+            Tw0 = Tcap_prev;
+            [h_rad_in, q_const_in] = rad_lin_coeff(cfg.endcap.eps_in, BC.sigma, Tw0, T_gas);
+            htot_in = cfg.endcap.h_in + h_rad_in;
+            if htot_in > 0
+                idx=idx+1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + htot_in*A_annulus;
+                b(pcap) = b(pcap) + htot_in*A_annulus*T_gas + q_const_in*A_annulus;
+            end
         end
 
-        % outside (to ambient) convection+radiation
-        if ~isfield(cfg.endcap,'h_out'); cfg.endcap.h_out = 0; end
-        if ~isfield(cfg.endcap,'eps_out'); cfg.endcap.eps_out = 0; end
+        % outside (to ambient)
         Tw1 = Tcap_prev;
         [h_rad_out, q_const_out] = rad_lin_coeff(cfg.endcap.eps_out, BC.sigma, Tw1, BC.T_amb);
         htot_out = cfg.endcap.h_out + h_rad_out;
         if htot_out > 0
-            idx = idx + 1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + htot_out*A_annulus;
+            idx=idx+1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + htot_out*A_annulus;
             b(pcap) = b(pcap) + htot_out*A_annulus*BC.T_amb + q_const_out*A_annulus;
         end
     end
 
     if cap_zL
-        pcap = p_capL; Tcap_prev = TcapL_prev;
-        % transient term
-        idx = idx + 1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + aPcap;
+        pcap     = p_capL;
+        Tcap_prev = TcapL_prev;
+
+        % transient
+        idx=idx+1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + aPcap;
         b(pcap) = b(pcap) + aPcap * Tcap_prev;
 
-        % inside (to gas) convection+radiation
-        if ~isfield(cfg.endcap,'h_in'); cfg.endcap.h_in = 0; end
-        if ~isfield(cfg.endcap,'eps_in'); cfg.endcap.eps_in = 0; end
-        Tw0 = Tcap_prev;
-        [h_rad_in, q_const_in] = rad_lin_coeff(cfg.endcap.eps_in, BC.sigma, Tw0, T_gas);
-        htot_in = cfg.endcap.h_in + h_rad_in;
-        if htot_in > 0
-            idx = idx + 1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + htot_in*A_annulus;
-            b(pcap) = b(pcap) + htot_in*A_annulus*T_gas + q_const_in*A_annulus;
+        % inside (to gas): only if gas reaches this end
+        if gas_exposed_zL
+            Tw0 = Tcap_prev;
+            [h_rad_in, q_const_in] = rad_lin_coeff(cfg.endcap.eps_in, BC.sigma, Tw0, T_gas);
+            htot_in = cfg.endcap.h_in + h_rad_in;
+            if htot_in > 0
+                idx=idx+1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + htot_in*A_annulus;
+                b(pcap) = b(pcap) + htot_in*A_annulus*T_gas + q_const_in*A_annulus;
+            end
         end
 
-        % outside (to ambient) convection+radiation
-        if ~isfield(cfg.endcap,'h_out'); cfg.endcap.h_out = 0; end
-        if ~isfield(cfg.endcap,'eps_out'); cfg.endcap.eps_out = 0; end
+        % outside (to ambient)
         Tw1 = Tcap_prev;
         [h_rad_out, q_const_out] = rad_lin_coeff(cfg.endcap.eps_out, BC.sigma, Tw1, BC.T_amb);
         htot_out = cfg.endcap.h_out + h_rad_out;
         if htot_out > 0
-            idx = idx + 1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + htot_out*A_annulus;
+            idx=idx+1; I(idx)=pcap; J(idx)=pcap; V(idx)=V(idx) + htot_out*A_annulus;
             b(pcap) = b(pcap) + htot_out*A_annulus*BC.T_amb + q_const_out*A_annulus;
         end
     end
 end
 
+% Main wall assembly
 for kk = 1:Nz
     for j = 1:Ntheta
         for i = 1:Nr
@@ -693,8 +1053,10 @@ for kk = 1:Nz
             aP = rhoCp_ring(i) * Vcv / dt;
             bP = aP * Tprev(i,j,kk);
 
-            % ---------- Radial conduction neighbors ----------
+            % Radial conduction neighbors
+            % ---------- Radial conduction / inner+outer BC ----------
             if i > 1
+                % conduction to i-1
                 r_face = r_imh;
                 Aface  = r_face * dtheta * dz;
                 dW     = ri - r_centers(i-1);
@@ -704,20 +1066,70 @@ for kk = 1:Nz
                 idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + GW;
                 q = sub2ind([Nr,Ntheta,Nz], i-1, j, kk);
                 idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx) - GW;
-            else
-                % Inner boundary: convection + radiation to gas
-                Tw0 = Tprev(i,j,kk);
-                [h_eff, q_const] = rad_lin_coeff(BC.eps_in, BC.sigma, Tw0, T_gas);
-                h_total = BC.h_in + h_eff;
 
+            else
+                % i == 1: inner boundary
                 r_face = r_imh;
                 Aface  = r_face * dtheta * dz;
 
-                idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + h_total*Aface;
-                bP = bP + h_total*Aface*T_gas + q_const*Aface;
+                if grain_present(kk)
+                    % ---- Port region (grain present): use main hot-gas BC + Step 2 multiplier ----
+                    m = m_in(kk);
+
+                    Tw0 = Tprev(i,j,kk);
+                    [h_eff, q_const] = rad_lin_coeff(BC.eps_in, BC.sigma, Tw0, T_gas);
+
+                    h_total = m * (BC.h_in + h_eff);
+
+                    if h_total > 0
+                        idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + h_total*Aface;
+                        bP = bP + h_total*Aface*T_gas + m*q_const*Aface;
+                    end
+
+                else
+                    % ---- Aft cavity region (no grain): apply reduced gas BC ----
+                    % Choose cavity gas temperature
+                    if isfield(BC,'T_gas_cav_mode') && strcmpi(BC.T_gas_cav_mode,'ambient')
+                        Tenv = BC.T_amb;
+                    else
+                        Tenv = T_gas;  % default: same as chamber gas for Step 3
+                    end
+
+                    % Get cavity parameters (with safe defaults)
+                    % Get cavity emissivity
+                    eps_cav = BC.eps_in_cav;
+
+                    % Base cavity h
+                    h_cav = cfg.noz.h_cav_base;
+
+                    % Apply throat-area proxy scaling (optional)
+                    if useNozProxy
+                        % Ratio that increases when throat is "large" relative to port cross-section
+                        % The exponent alpha lets you tune sensitivity without changing sign/behavior.
+                        ratio = cfg.noz.CdA * (At / max(Aport, 1e-12));
+
+                        h_cav = cfg.noz.h_cav_base * (ratio ^ cfg.noz.alpha);
+
+                        % Clamp for numerical/physical sanity
+                        h_cav = min(max(h_cav, cfg.noz.h_cav_min), cfg.noz.h_cav_max);
+                    end
+
+
+                    Tw0 = Tprev(i,j,kk);
+                    [h_eff, q_const] = rad_lin_coeff(eps_cav, BC.sigma, Tw0, Tenv);
+
+                    h_total = h_cav + h_eff;
+
+                    if h_total > 0
+                        idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + h_total*Aface;
+                        bP = bP + h_total*Aface*Tenv + q_const*Aface;
+                    end
+                end
             end
 
+
             if i < Nr
+                % conduction to i+1
                 r_face = r_iph;
                 Aface  = r_face * dtheta * dz;
                 dE     = r_centers(i+1) - ri;
@@ -727,8 +1139,9 @@ for kk = 1:Nz
                 idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + GE;
                 q = sub2ind([Nr,Ntheta,Nz], i+1, j, kk);
                 idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx) - GE;
+
             else
-                % Outer boundary: convection + radiation to ambient
+                % i == Nr: outer boundary
                 Tw0 = Tprev(i,j,kk);
                 [h_eff, q_const] = rad_lin_coeff(BC.eps_out, BC.sigma, Tw0, BC.T_amb);
                 h_total = BC.h_out + h_eff;
@@ -740,11 +1153,12 @@ for kk = 1:Nz
                 bP = bP + h_total*Aface*BC.T_amb + q_const*Aface;
             end
 
-            % ---------- Theta conduction neighbors (periodic) ----------
-            dr_i = (r_iph - r_imh);
+
+            % Theta conduction neighbors (periodic)
+            dr_i   = (r_iph - r_imh);
             Atheta = dr_i * dz;
-            ds = ri * dtheta;
-            Gth = k_ring(i) * Atheta / ds;
+            ds     = ri * dtheta;
+            Gth    = k_ring(i) * Atheta / ds;
 
             jE = jp(j); jW = jm(j);
             qE = sub2ind([Nr,Ntheta,Nz], i, jE, kk);
@@ -754,7 +1168,7 @@ for kk = 1:Nz
             idx=idx+1; I(idx)=p; J(idx)=qE; V(idx)=V(idx) - Gth;
             idx=idx+1; I(idx)=p; J(idx)=qW; V(idx)=V(idx) - Gth;
 
-            % ---------- Axial conduction neighbors ----------
+            % Axial conduction neighbors
             Az = 0.5*(r_iph^2 - r_imh^2) * dtheta;
             Gz = k_ring(i) * Az / dz;
 
@@ -763,9 +1177,10 @@ for kk = 1:Nz
                 idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + Gz;
                 idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx) - Gz;
             else
-                % z=0 end: either couple to endcap, or apply endBC
+                % z=0 end
                 if cap_z0
                     Gcap = cfg.endcap.k * Az / cfg.endcap.thickness;
+
                     idx=idx+1; I(idx)=p;      J(idx)=p;      V(idx)=V(idx) + Gcap;
                     idx=idx+1; I(idx)=p;      J(idx)=p_cap0; V(idx)=V(idx) - Gcap;
 
@@ -788,6 +1203,7 @@ for kk = 1:Nz
                 % z=L end
                 if cap_zL
                     Gcap = cfg.endcap.k * Az / cfg.endcap.thickness;
+
                     idx=idx+1; I(idx)=p;      J(idx)=p;      V(idx)=V(idx) + Gcap;
                     idx=idx+1; I(idx)=p;      J(idx)=p_capL; V(idx)=V(idx) - Gcap;
 
@@ -802,16 +1218,19 @@ for kk = 1:Nz
                 end
             end
 
-            % ---------- Transient term ----------
+            % Transient term
             idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + aP;
             b(p) = bP;
         end
     end
 end
 
-% finalize sparse
-I = I(1:idx); J = J(1:idx); V = V(1:idx);
+% Finalize sparse
+I = I(1:idx);
+J = J(1:idx);
+V = V(1:idx);
 A = sparse(I,J,V,N,N);
+
 end
 
 % function [Tavg, Tmax] = outer_wall_stats(T)
@@ -853,6 +1272,7 @@ xlabel('Time [s]');
 ylabel('Outer wall temperature [K]');
 title('Outer surface temperature (avg and max around \theta)');
 legend('avg', 'max', 'Location', 'best');
+
 
 % ---- Build original-style radius-time matrices on a fixed reference radius ----
 % Use the initial snapshot's radial centers as the fixed plotting grid
@@ -1162,10 +1582,17 @@ end
 
 % Choose layout
 if doDel
-    figTitle = 'Energy diagnostics (with deletion diagnostics)';
+    baseTitle = 'Energy diagnostics (with deletion diagnostics)';
 else
-    figTitle = 'Energy diagnostics';
+    baseTitle = 'Energy diagnostics';
 end
+
+if isfield(cfg,'diagLabel') && ~isempty(cfg.diagLabel)
+    figTitle = sprintf('%s | %s', baseTitle, cfg.diagLabel);
+else
+    figTitle = baseTitle;
+end
+
 
 fig = figure('Name', figTitle);
 clf(fig);
@@ -1334,4 +1761,584 @@ if den <= 0
 else
     hm = 2 * a * b / den;
 end
+end
+
+function Ecap = endcap_internal_energy(Tcap0, TcapL, r_faces, cfg, BC)
+Ecap = 0.0;
+
+if ~(isfield(cfg,'endcap') && isfield(cfg.endcap,'enable') && cfg.endcap.enable)
+    return;
+end
+
+% Match assembler geometry exactly
+r_inner = r_faces(1);
+r_outer = r_faces(end);
+A_annulus = pi * (r_outer^2 - r_inner^2);
+
+rhoCp_cap = cfg.endcap.rho * cfg.endcap.cp;
+Vcap = A_annulus * cfg.endcap.thickness;   % EXACTLY as in assembly
+
+if ~isfield(cfg.endcap,'ends'); cfg.endcap.ends = 'both'; end
+if strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'z0')
+    Ecap = Ecap + rhoCp_cap * Vcap * Tcap0;
+end
+if strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'zL')
+    Ecap = Ecap + rhoCp_cap * Vcap * TcapL;
+end
+end
+
+function Mdiag = build_Mdiag_wall_endcap(r_faces, r_centers, dtheta, dz, rhoCp_ring, dt, cfg)
+% Returns Mdiag (J/K) for all unknowns in the SAME ordering as Tvec:
+% first Nwall entries are wall cells (sub2ind ordering), then optional endcap nodes.
+
+Nr = numel(r_centers);
+Ntheta = cfg.Ntheta;
+Nz = cfg.Nz;
+
+Nwall = Nr*Ntheta*Nz;
+
+Mdiag = zeros(Nwall,1);
+
+% Wall cells: M = rhoCp * Vcv (J/K)
+idxp = 0;
+for kk = 1:Nz
+    for j = 1:Ntheta
+        for i = 1:Nr
+            idxp = idxp + 1;
+            r_imh = r_faces(i);
+            r_iph = r_faces(i+1);
+            Vcv = 0.5*(r_iph^2 - r_imh^2) * dtheta * dz;
+            Mdiag(idxp) = rhoCp_ring(i) * Vcv;
+        end
+    end
+end
+
+% Endcaps: lumped M = rhoCp * Vcap (J/K), appended after wall unknowns
+useEndcap = isfield(cfg,'endcap') && isfield(cfg.endcap,'enable') && cfg.endcap.enable;
+if useEndcap
+    if ~isfield(cfg.endcap,'ends'); cfg.endcap.ends = 'both'; end
+
+    r_inner = r_faces(1);
+    r_outer = r_faces(end);
+    A_annulus = pi*(r_outer^2 - r_inner^2);
+
+    rhoCp_cap = cfg.endcap.rho * cfg.endcap.cp;
+    Vcap = A_annulus * cfg.endcap.thickness;
+    Mcap = rhoCp_cap * Vcap;
+
+    cap_z0 = strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'z0');
+    cap_zL = strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'zL');
+
+    if cap_z0 && cap_zL
+        Mdiag = [Mdiag; Mcap; Mcap];
+    elseif cap_z0 || cap_zL
+        Mdiag = [Mdiag; Mcap];
+    end
+end
+
+end
+
+function diag = energy_diag_from_Ab(A, b, Tnew_vec, Tprev_vec, Mdiag, dt, Nwall)
+% Computes the net heat implied by the assembled linear system:
+%   dQ_implied = dt * sum( beff - Aeff*Tnew )
+% where Aeff = A - diag(M/dt), beff = b - (M/dt)*Tprev.
+%
+% Also splits wall vs endcap contributions by row-summing over those equations.
+
+N = numel(Tnew_vec);
+assert(numel(Mdiag) == N, 'Mdiag length must match Tvec length.');
+
+Aeff = A - spdiags(Mdiag/dt, 0, N, N);
+beff = b - (Mdiag/dt).*Tprev_vec;
+
+rhs_minus_lhs = beff - (Aeff*Tnew_vec);   % W (net into each equation node)
+dQ_implied_total = dt * sum(rhs_minus_lhs);  % J
+
+% Energy change from masses (should match dQ_implied_total if BE assembly is self-consistent)
+dE_mass_total = sum(Mdiag .* (Tnew_vec - Tprev_vec)); % J
+
+% Split by equation groups (row sets)
+rows_wall = 1:Nwall;
+dQ_implied_wall = dt * sum(rhs_minus_lhs(rows_wall));
+dE_mass_wall    = sum(Mdiag(rows_wall) .* (Tnew_vec(rows_wall) - Tprev_vec(rows_wall)));
+
+rows_cap = (Nwall+1):N;
+if isempty(rows_cap)
+    dQ_implied_cap = 0;
+    dE_mass_cap    = 0;
+else
+    dQ_implied_cap = dt * sum(rhs_minus_lhs(rows_cap));
+    dE_mass_cap    = sum(Mdiag(rows_cap) .* (Tnew_vec(rows_cap) - Tprev_vec(rows_cap)));
+end
+
+diag.dQ_implied_total = dQ_implied_total;
+diag.dE_mass_total    = dE_mass_total;
+diag.resid_total      = dE_mass_total - dQ_implied_total;
+
+diag.dQ_implied_wall  = dQ_implied_wall;
+diag.dE_mass_wall     = dE_mass_wall;
+diag.resid_wall       = dE_mass_wall - dQ_implied_wall;
+
+diag.dQ_implied_cap   = dQ_implied_cap;
+diag.dE_mass_cap      = dE_mass_cap;
+diag.resid_cap        = dE_mass_cap - dQ_implied_cap;
+
+end
+
+function cache = build_BE_polar3D_cache(r_faces, r_centers, dtheta, dz, k_ring, rhoCp_ring, dt, cfg, Lg, Ntheta, Nz)
+Nr = numel(r_centers);
+Nwall = Nr*Ntheta*Nz;
+
+useEndcap = isfield(cfg,'endcap') && isfield(cfg.endcap,'enable') && cfg.endcap.enable;
+cap_z0 = false; cap_zL = false;
+if useEndcap
+    if ~isfield(cfg.endcap,'ends'); cfg.endcap.ends = 'both'; end
+    cap_z0 = strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'z0');
+    cap_zL = strcmpi(cfg.endcap.ends,'both') || strcmpi(cfg.endcap.ends,'zL');
+end
+Ncap = double(cap_z0) + double(cap_zL);
+N = Nwall + Ncap;
+
+% Endcap node indices
+p_cap0 = []; p_capL = [];
+if cap_z0, p_cap0 = Nwall + 1; end
+if cap_zL, p_capL = Nwall + 1 + double(cap_z0); end
+
+% Precompute z centers (used for insul masks and grain-present mask later)
+z_centers = ((1:Nz) - 0.5) * dz;
+
+% Surface indexing helpers (wall nodes only)
+% All (j,kk) for i=1 and i=Nr
+[jGrid,kGrid] = ndgrid(1:Ntheta, 1:Nz);
+jList = jGrid(:);
+kList = kGrid(:);
+
+idx_i1  = sub2ind([Nr, Ntheta, Nz], ones(size(jList)), jList, kList);
+idx_iNr = sub2ind([Nr, Ntheta, Nz], Nr*ones(size(jList)), jList, kList);
+
+cache.kList_i1 = kList;   % k index aligned with idx_i1 ordering
+
+% Cache aP_wall as a vector (wall unknowns only)
+aP_wall = zeros(Nwall,1);
+for kk=1:Nz
+    for j=1:Ntheta
+        for i=1:Nr
+            p = sub2ind([Nr,Ntheta,Nz], i, j, kk);
+            r_imh = r_faces(i);
+            r_iph = r_faces(i+1);
+            Vcv = 0.5*(r_iph^2 - r_imh^2) * dtheta * dz;
+            aP_wall(p) = rhoCp_ring(i) * Vcv / dt;
+        end
+    end
+end
+
+% Build A_base (conduction + transient + endcap coupling only)
+% Estimate nonzeros per row ~ 10..14
+nz_est = N * 14;
+I = zeros(nz_est,1);
+J = zeros(nz_est,1);
+V = zeros(nz_est,1);
+idx = 0;
+
+% theta periodic
+jp = @(j) (j < Ntheta) * (j+1) + (j==Ntheta) * 1;
+jm = @(j) (j > 1)     * (j-1) + (j==1)     * Ntheta;
+
+for kk=1:Nz
+    for j=1:Ntheta
+        for i=1:Nr
+            p = sub2ind([Nr,Ntheta,Nz], i, j, kk);
+
+            r_imh = r_faces(i);
+            r_iph = r_faces(i+1);
+            ri    = r_centers(i);
+
+            % -------- Radial conduction interior only (no BC terms) --------
+            if i > 1
+                r_face = r_imh;
+                Aface  = r_face * dtheta * dz;
+                dW     = ri - r_centers(i-1);
+                k_face = harmonic_mean(k_ring(i-1), k_ring(i));
+                GW     = k_face * Aface / dW;
+
+                idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx)+GW;
+                q = sub2ind([Nr,Ntheta,Nz], i-1, j, kk);
+                idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx)-GW;
+            end
+            if i < Nr
+                r_face = r_iph;
+                Aface  = r_face * dtheta * dz;
+                dE     = r_centers(i+1) - ri;
+                k_face = harmonic_mean(k_ring(i), k_ring(i+1));
+                GE     = k_face * Aface / dE;
+
+                idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx)+GE;
+                q = sub2ind([Nr,Ntheta,Nz], i+1, j, kk);
+                idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx)-GE;
+            end
+
+            % -------- Theta conduction (periodic) --------
+            dr_i   = (r_iph - r_imh);
+            Atheta = dr_i * dz;
+            ds     = ri * dtheta;
+            Gth    = k_ring(i) * Atheta / ds;
+
+            jE = jp(j); jW = jm(j);
+            qE = sub2ind([Nr,Ntheta,Nz], i, jE, kk);
+            qW = sub2ind([Nr,Ntheta,Nz], i, jW, kk);
+
+            idx=idx+1; I(idx)=p; J(idx)=p;  V(idx)=V(idx) + 2*Gth;
+            idx=idx+1; I(idx)=p; J(idx)=qE; V(idx)=V(idx) - Gth;
+            idx=idx+1; I(idx)=p; J(idx)=qW; V(idx)=V(idx) - Gth;
+
+            % -------- Axial conduction interior; endcap coupling if enabled --------
+            Az = 0.5*(r_iph^2 - r_imh^2) * dtheta;
+            Gz = k_ring(i) * Az / dz;
+
+            if kk > 1
+                q = sub2ind([Nr,Ntheta,Nz], i, j, kk-1);
+                idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx)+Gz;
+                idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx)-Gz;
+            else
+                if cap_z0
+                    if ~isfield(cfg.endcap,'thickness'); cfg.endcap.thickness = dz; end
+                    if ~isfield(cfg.endcap,'k'); cfg.endcap.k = 1.0; end
+                    Gcap = cfg.endcap.k * Az / cfg.endcap.thickness;
+
+                    idx=idx+1; I(idx)=p;      J(idx)=p;      V(idx)=V(idx) + Gcap;
+                    idx=idx+1; I(idx)=p;      J(idx)=p_cap0; V(idx)=V(idx) - Gcap;
+
+                    idx=idx+1; I(idx)=p_cap0; J(idx)=p_cap0; V(idx)=V(idx) + Gcap;
+                    idx=idx+1; I(idx)=p_cap0; J(idx)=p;      V(idx)=V(idx) - Gcap;
+                end
+            end
+
+            if kk < Nz
+                q = sub2ind([Nr,Ntheta,Nz], i, j, kk+1);
+                idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx)+Gz;
+                idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx)-Gz;
+            else
+                if cap_zL
+                    if ~isfield(cfg.endcap,'thickness'); cfg.endcap.thickness = dz; end
+                    if ~isfield(cfg.endcap,'k'); cfg.endcap.k = 1.0; end
+                    Gcap = cfg.endcap.k * Az / cfg.endcap.thickness;
+
+                    idx=idx+1; I(idx)=p;      J(idx)=p;      V(idx)=V(idx) + Gcap;
+                    idx=idx+1; I(idx)=p;      J(idx)=p_capL; V(idx)=V(idx) - Gcap;
+
+                    idx=idx+1; I(idx)=p_capL; J(idx)=p_capL; V(idx)=V(idx) + Gcap;
+                    idx=idx+1; I(idx)=p_capL; J(idx)=p;      V(idx)=V(idx) - Gcap;
+                end
+            end
+
+            % -------- Transient diagonal --------
+            idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + aP_wall(p);
+        end
+    end
+end
+
+% Endcap transient diagonal gets included in A_base too
+aPcap = 0;
+A_annulus = [];
+if useEndcap
+    if ~isfield(cfg.endcap,'thickness'); cfg.endcap.thickness = dz; end
+    if ~isfield(cfg.endcap,'rho'); cfg.endcap.rho = 1000; end
+    if ~isfield(cfg.endcap,'cp');  cfg.endcap.cp  = 1000; end
+
+    r_inner = r_faces(1);
+    r_outer = r_faces(end);
+    A_annulus = pi * (r_outer^2 - r_inner^2);
+    Vcap = A_annulus * cfg.endcap.thickness;
+    aPcap = (cfg.endcap.rho * cfg.endcap.cp) * Vcap / dt;
+
+    if cap_z0
+        idx=idx+1; I(idx)=p_cap0; J(idx)=p_cap0; V(idx)=V(idx) + aPcap;
+    end
+    if cap_zL
+        idx=idx+1; I(idx)=p_capL; J(idx)=p_capL; V(idx)=V(idx) + aPcap;
+    end
+end
+
+I = I(1:idx); J = J(1:idx); V = V(1:idx);
+A_base = sparse(I,J,V,N,N);
+
+% Pack cache
+cache = struct();
+cache.Nr = Nr; cache.Ntheta = Ntheta; cache.Nz = Nz;
+cache.Nwall = Nwall; cache.Ncap = Ncap; cache.N = N;
+cache.cap_z0 = cap_z0; cache.cap_zL = cap_zL;
+cache.p_cap0 = p_cap0; cache.p_capL = p_capL;
+
+cache.r_faces = r_faces;
+cache.r_centers = r_centers;
+cache.dtheta = dtheta; cache.dz = dz;
+cache.z_centers = z_centers;
+
+cache.A_base = A_base;
+cache.aP_wall = aP_wall;
+
+cache.idx_i1 = idx_i1;
+cache.idx_iNr = idx_iNr;
+
+cache.Ain_face = r_faces(1) * dtheta * dz;
+cache.Aout_face = r_faces(end) * dtheta * dz;
+
+cache.A_annulus = A_annulus;
+cache.aPcap = aPcap;
+end
+
+function [A, b] = assemble_from_cache_BE_polar3D(cache, Tprev, Tcap0_prev, TcapL_prev, BC, T_gas, cfg, Lg)
+N = cache.N;
+Nwall = cache.Nwall;
+
+% Start with transient RHS (vectorized)
+b = zeros(N,1);
+b(1:Nwall) = cache.aP_wall .* Tprev(:);
+
+% Endcap transient RHS
+useEndcap = cache.Ncap > 0;
+if useEndcap
+    if cache.cap_z0
+        b(cache.p_cap0) = b(cache.p_cap0) + cache.aPcap * Tcap0_prev;
+    end
+    if cache.cap_zL
+        b(cache.p_capL) = b(cache.p_capL) + cache.aPcap * TcapL_prev;
+    end
+end
+
+% BC diagonal additions
+diag_add = zeros(N,1);
+
+Nr = cache.Nr; Ntheta = cache.Ntheta; Nz = cache.Nz;
+z_centers = cache.z_centers;
+
+% Grain present mask
+grain_present = (z_centers <= Lg + 1e-12);
+
+% Step 2 insulation multiplier along z
+m_in = ones(Nz,1);
+useWallInsul = isfield(cfg,'wall_insul') && isfield(cfg.wall_insul,'enable') && cfg.wall_insul.enable;
+if useWallInsul
+    if ~isfield(cfg.wall_insul,'end');    cfg.wall_insul.end = 'z0'; end
+    if ~isfield(cfg.wall_insul,'length'); cfg.wall_insul.length = 0.0; end
+    if ~isfield(cfg.wall_insul,'factor'); cfg.wall_insul.factor = 0.0; end
+
+    if strcmpi(cfg.wall_insul.end,'z0')
+        mask = (z_centers <= cfg.wall_insul.length);
+    elseif strcmpi(cfg.wall_insul.end,'zL')
+        mask = (z_centers >= (max(z_centers) - cfg.wall_insul.length));
+    else
+        error('cfg.wall_insul.end must be ''z0'' or ''zL''.');
+    end
+    m_in(mask) = cfg.wall_insul.factor;
+end
+
+% Nozzle proxy scaling (Step 4)
+useNozProxy = isfield(cfg,'noz') && isfield(cfg.noz,'enableProxy') && cfg.noz.enableProxy;
+r_inner = cache.r_faces(1);
+Aport = pi * r_inner^2;
+At = [];
+if useNozProxy
+    r_t = cfg.noz.r_t;
+    At = pi * r_t^2;
+end
+
+% ---------- Inner wall BC (i=1) ----------
+idx_i1 = cache.idx_i1;                    % length Ntheta*Nz
+Tw_i1 = Tprev(idx_i1);                    % uses column-major consistent with Tprev(:)
+Aface = cache.Ain_face;
+
+% We need per-(j,kk) info; j doesn’t matter for BC coefficients, kk does
+% Build kk list aligned with idx_i1 construction in cache
+% --- k-index list for i==1 nodes (must match idx_i1 ordering) ---
+if isfield(cache,'kList_i1') && ~isempty(cache.kList_i1)
+    kk_list = cache.kList_i1;
+else
+    % Backward-compatible fallback for old caches
+    [~, kGrid] = ndgrid(1:Ntheta, 1:Nz);  % ndgrid matches idx_i1 construction
+    kk_list = kGrid(:);
+end
+
+
+for t = 1:numel(idx_i1)
+    p = idx_i1(t);
+    kk = kk_list(t);
+    Tw0 = Tw_i1(t);
+
+    if grain_present(kk)
+        m = m_in(kk);
+        [h_eff, q_const] = rad_lin_coeff(BC.eps_in, BC.sigma, Tw0, T_gas);
+        h_total = m * (BC.h_in + h_eff);
+        if h_total > 0
+            diag_add(p) = diag_add(p) + h_total*Aface;
+            b(p) = b(p) + h_total*Aface*T_gas + m*q_const*Aface;
+        end
+    else
+        % aft cavity region
+        if isfield(BC,'T_gas_cav_mode') && strcmpi(BC.T_gas_cav_mode,'ambient')
+            Tenv = BC.T_amb;
+        else
+            Tenv = T_gas;
+        end
+
+        eps_cav = BC.eps_in_cav;
+        h_cav = cfg.noz.h_cav_base;
+
+        if useNozProxy
+            ratio = cfg.noz.CdA * (At / max(Aport, 1e-12));
+            h_cav = cfg.noz.h_cav_base * (ratio ^ cfg.noz.alpha);
+            h_cav = min(max(h_cav, cfg.noz.h_cav_min), cfg.noz.h_cav_max);
+        end
+
+        [h_eff, q_const] = rad_lin_coeff(eps_cav, BC.sigma, Tw0, Tenv);
+        h_total = h_cav + h_eff;
+        if h_total > 0
+            diag_add(p) = diag_add(p) + h_total*Aface;
+            b(p) = b(p) + h_total*Aface*Tenv + q_const*Aface;
+        end
+    end
+end
+
+% ---------- Outer wall BC (i=Nr) ----------
+idx_iNr = cache.idx_iNr;
+Tw_iNr = Tprev(idx_iNr);
+Aface_out = cache.Aout_face;
+
+for t = 1:numel(idx_iNr)
+    p = idx_iNr(t);
+    Tw0 = Tw_iNr(t);
+    [h_eff, q_const] = rad_lin_coeff(BC.eps_out, BC.sigma, Tw0, BC.T_amb);
+    h_total = BC.h_out + h_eff;
+    if h_total > 0
+        diag_add(p) = diag_add(p) + h_total*Aface_out;
+        b(p) = b(p) + h_total*Aface_out*BC.T_amb + q_const*Aface_out;
+    end
+end
+
+% ---------- Endcap lumped BCs ----------
+if useEndcap
+    if ~isfield(cfg.endcap,'h_in');    cfg.endcap.h_in = 0; end
+    if ~isfield(cfg.endcap,'eps_in');  cfg.endcap.eps_in = 0; end
+    if ~isfield(cfg.endcap,'h_out');   cfg.endcap.h_out = 0; end
+    if ~isfield(cfg.endcap,'eps_out'); cfg.endcap.eps_out = 0; end
+
+    % Defaults for gas exposure flags
+    gas_exposed_z0 = true;
+    gas_exposed_zL = true;
+    if isfield(cfg.endcap,'gas_exposed_z0'); gas_exposed_z0 = cfg.endcap.gas_exposed_z0; end
+    if isfield(cfg.endcap,'gas_exposed_zL'); gas_exposed_zL = cfg.endcap.gas_exposed_zL; end
+
+    A_ann = cache.A_annulus;
+
+    if cache.cap_z0
+        pcap = cache.p_cap0;
+        Tw_cap = Tcap0_prev;
+
+        % inside to gas
+        if gas_exposed_z0
+            [h_rad_in, q_const_in] = rad_lin_coeff(cfg.endcap.eps_in, BC.sigma, Tw_cap, T_gas);
+            htot_in = cfg.endcap.h_in + h_rad_in;
+            if htot_in > 0
+                diag_add(pcap) = diag_add(pcap) + htot_in*A_ann;
+                b(pcap) = b(pcap) + htot_in*A_ann*T_gas + q_const_in*A_ann;
+            end
+        end
+
+        % outside to ambient
+        [h_rad_out, q_const_out] = rad_lin_coeff(cfg.endcap.eps_out, BC.sigma, Tw_cap, BC.T_amb);
+        htot_out = cfg.endcap.h_out + h_rad_out;
+        if htot_out > 0
+            diag_add(pcap) = diag_add(pcap) + htot_out*A_ann;
+            b(pcap) = b(pcap) + htot_out*A_ann*BC.T_amb + q_const_out*A_ann;
+        end
+    end
+
+    if cache.cap_zL
+        pcap = cache.p_capL;
+        Tw_cap = TcapL_prev;
+
+        if gas_exposed_zL
+            [h_rad_in, q_const_in] = rad_lin_coeff(cfg.endcap.eps_in, BC.sigma, Tw_cap, T_gas);
+            htot_in = cfg.endcap.h_in + h_rad_in;
+            if htot_in > 0
+                diag_add(pcap) = diag_add(pcap) + htot_in*A_ann;
+                b(pcap) = b(pcap) + htot_in*A_ann*T_gas + q_const_in*A_ann;
+            end
+        end
+
+        [h_rad_out, q_const_out] = rad_lin_coeff(cfg.endcap.eps_out, BC.sigma, Tw_cap, BC.T_amb);
+        htot_out = cfg.endcap.h_out + h_rad_out;
+        if htot_out > 0
+            diag_add(pcap) = diag_add(pcap) + htot_out*A_ann;
+            b(pcap) = b(pcap) + htot_out*A_ann*BC.T_amb + q_const_out*A_ann;
+        end
+    end
+end
+
+% Final system
+A = cache.A_base + spdiags(diag_add, 0, N, N);
+end
+
+function x = pack_state_vec(Twall, cap_z0, cap_zL, Tcap0, TcapL)
+% Pack [Twall(:); optional caps] in the same ordering as assembler expects.
+x = Twall(:);
+if cap_z0, x = [x; Tcap0]; end
+if cap_zL, x = [x; TcapL]; end
+end
+
+function [Twall, Tcap0, TcapL] = unpack_state_vec(x, Nr, Ntheta, Nz, cap_z0, cap_zL)
+% Unpack x into wall and optional caps.
+Nwall = Nr*Ntheta*Nz;
+Twall = reshape(x(1:Nwall), [Nr, Ntheta, Nz]);
+p = Nwall;
+
+Tcap0 = [];
+TcapL = [];
+if cap_z0
+    Tcap0 = x(p+1); p = p+1;
+end
+if cap_zL
+    TcapL = x(p+1);
+end
+end
+
+function [isBurning,T_gas,ndel,willDelete,willDel_hist,Lg,grain_present,n_grain] = compute_step_state(step, t, T, r_centers, dz, burn, geom, BC, cfg)
+
+% ---- burn state + gas temp ----
+isBurning = (t < burn.t_burn + 1e-12);
+if isBurning
+    T_gas = BC.T_gas;
+else
+    tau_gas = 20;  % [s] tune to test data
+    T_gas = BC.T_amb + (BC.T_gas - BC.T_amb) * exp(-(t - burn.t_burn)/tau_gas);
+end
+
+% ---- Decide deletion NOW (based on current t) ----
+if isBurning
+    r_front = geom.r_inner0 + burn.rburn * t;
+    ndel = sum(r_centers < r_front);
+else
+    ndel = 0;
+end
+ndel = min(ndel, numel(r_centers)-2);
+
+willDelete = (ndel > 0);
+willDel_hist(step+1) = willDelete;
+
+if mod(step,cfg.status_every)==0 && willDelete
+    fprintf('   deletion planned: ndel = %d (Nr before = %d)\n', ndel, numel(r_centers));
+end
+
+% ---- current grain length Lg(t) ----
+if isfield(cfg,'grain') && isfield(cfg.grain,'enable_axial_regression') && cfg.grain.enable_axial_regression
+    Lg = max(0.0, cfg.grain.Lg0 - cfg.grain.rb_end * t);
+else
+    Lg = cfg.L;
+end
+
+Nz = size(T,3);
+z_centers = ((1:Nz) - 0.5) * dz;
+grain_present = (z_centers <= Lg + 1e-12);
+n_grain = sum(grain_present);
+
 end
