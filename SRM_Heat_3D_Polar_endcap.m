@@ -39,7 +39,16 @@ layers(3).thickness = 0.00338;
 % geometry / burn
 geom.r_inner0 = 0.050;
 burn.t_burn = 6;
-burn.rburn  = layers(1).thickness / burn.t_burn;  % aligns with your intent
+burn.rburn  = layers(1).thickness / burn.t_burn;
+
+cfg.store_every = 1;     % store every N steps
+cfg.max_cells = 4e6;      % safety
+cfg.Ntheta = 64;          % circumferential resolution (>= 8)
+cfg.Nz = 600;              % axial resolution (>=1)
+cfg.endBC = 'adiabatic';    % 'adiabatic' or 'robin' at z=0 and z=L
+
+time.dt = 0.090;
+time.t_final = 100.0;
 
 % boundary conditions
 BC.T_gas = 2300;          % "inner" gas temperature
@@ -59,14 +68,7 @@ BC.h_z0 = 30;               % end convection at z=0 if endBC='robin'
 BC.h_zL = 30;               % end convection at z=L if endBC='robin'
 cfg.L = 1.0;              % unit length (m)
 
-time.dt = 0.050;
-time.t_final = 50.0;
 
-cfg.store_every = 1;     % store every N steps
-cfg.max_cells = 2e6;      % safety
-cfg.Ntheta = 30;          % circumferential resolution (>= 8)
-cfg.Nz = 100;              % axial resolution (>=1)
-cfg.endBC = 'adiabatic';    % 'adiabatic' or 'robin' at z=0 and z=L
 
 % ---- Step 4: nozzle/throat proxy for aft-cavity convection ----
 cfg.noz.enableProxy = true;
@@ -107,8 +109,8 @@ cfg.grain.rb_end = burn.rburn; % rb_end = rb_radial
 % ---- runtime status monitoring ----
 cfg.status_every = 20;     % print every N time steps
 cfg.time_warn    = 2.0;    % warn if a step takes > this many seconds
-cfg.doEnergyDiagnostics = true;     % master switch for all plots/prints below
-cfg.doDeletionDiagnostics = true;   % requires Qcond12A_hist + willDel_hist
+cfg.doEnergyDiagnostics = false;     % master switch for all plots/prints below
+cfg.doDeletionDiagnostics = false;   % requires Qcond12A_hist + willDel_hist
 
 % ---- NEW: diag flag (used by the drop-in block) ----
 cfg.diag.consistency = true;
@@ -151,6 +153,18 @@ fprintf('Grid: Nr=%d, Ntheta=%d, dr=%.6g m, dt=%.6g s, Fo_prop~%.3g\n', Nr, Nthe
 
 %% -------------------- Time integration --------------------
 nsteps = round(time.t_final / time.dt);
+timing = struct( ...
+    'cache', 0.0, ...
+    'assembly', 0.0, ...
+    'prec', 0.0, ...
+    'solve', 0.0, ...
+    'diagAb', 0.0, ...
+    'bcHeat', 0.0, ...
+    'deletion', 0.0, ...
+    'store', 0.0, ...
+    'other', 0.0 );
+
+timing_step = timing;   % optional: for per-step debugging
 
 % ---- Energy balance tracking ----
 N = nsteps;  % number of steps with solves
@@ -213,10 +227,16 @@ t_store      = [];
 %% =========================
 % MAIN TIME LOOP
 %% =========================
+cache_rebuild_count = 0;
 for step = 0:nsteps
     t = step * time.dt;
+    t_step_total = tic;
+    % ---- per-step timing locals (so "Other" is a true residual) ----
+    store_time = 0; cache_time = 0; asm_time = 0; prec_time = 0; solve_time = 0;
+    diagAb_time = 0; bc_time = 0; del_time = 0;
 
     % ---- store ----
+    t_store_blk = tic;
     if mod(step, cfg.store_every) == 0
         T2 = mean(T,3);  % axial average for plotting/stats
 
@@ -232,6 +252,9 @@ for step = 0:nsteps
         snap(end).Tbar_r = mean(T2, 2);
         snap(end).Tmax_r = max(T2, [], 2);
     end
+    store_time = toc(t_store_blk);
+    timing.store = timing.store + store_time;
+
 
     if step == nsteps
         break;
@@ -259,12 +282,30 @@ for step = 0:nsteps
 
 
     % Build cache once (or rebuild after any deletion that changes Nr / r_faces / r_centers)
-    if ~exist('cache3D','var') || isempty(cache3D) || cache3D.Nr ~= numel(r_centers) ...
-            || cache3D.Ntheta ~= size(Tprev,2) || cache3D.Nz ~= size(Tprev,3)
+    t_cache = tic;
+
+    rebuildCache = ~exist('cache3D','var') || isempty(cache3D) || ...
+        cache3D.Nr ~= numel(r_centers) || ...
+        cache3D.Ntheta ~= size(Tprev,2) || ...
+        cache3D.Nz ~= size(Tprev,3);
+    
+    if rebuildCache
+        cache_rebuild_count = cache_rebuild_count + 1;
+    
         cache3D = build_BE_polar3D_cache( ...
             r_faces, r_centers, dtheta, dz, ...
             k_ring, rhoCp_ring, time.dt, cfg, Lg, size(Tprev,2), size(Tprev,3));
     end
+    if rebuildCache && mod(step, cfg.status_every) == 0
+        fprintf('   cache rebuilt #%d (%.3f s)\n', cache_rebuild_count, cache_time);
+    end
+    if ~isfield(cache3D,'Mdiag') || isempty(cache3D.Mdiag)
+        cache3D.Mdiag = build_Mdiag_wall_endcap(r_faces, r_centers, dtheta, dz, rhoCp_ring, time.dt, cfg);
+    end
+
+    cache_time = toc(t_cache);
+    timing.cache = timing.cache + cache_time;
+
 
     t_asm = tic;
 
@@ -273,6 +314,7 @@ for step = 0:nsteps
     asm_time = toc(t_asm);
 
     t_solve = tic;
+    timing.assembly = timing.assembly + asm_time;
     % ---- endcap presence flags (must exist before pack_state_vec) ----
     cap_z0 = false;
     cap_zL = false;
@@ -332,6 +374,7 @@ for step = 0:nsteps
     end
 
     % --- Build preconditioner if needed ---
+    t_prec = tic;
     if needPrec
         if ~isfield(cfg.solve,'ichol_droptol');   cfg.solve.ichol_droptol = 1e-3; end
         if ~isfield(cfg.solve,'ichol_diagcomp');  cfg.solve.ichol_diagcomp = 1e-3; end
@@ -351,6 +394,8 @@ for step = 0:nsteps
         end
         cache3D.precN = N;
     end
+    prec_time = toc(t_prec);
+    timing.prec = timing.prec + prec_time;
 
     % --- Solve with rails (retry tightening then direct fallback) ---
     Tvec = [];
@@ -363,7 +408,7 @@ for step = 0:nsteps
             [Tvec, flag, relres, iters] = pcg(A, b, tol, maxit, cache3D.M, cache3D.Mt, x0);
         else
             solverName = 'gmres';
-            restart = 50;
+            restart = 75;
             [Tvec, flag, relres, iters] = gmres(A, b, restart, tol, maxit, cache3D.L, cache3D.U, x0);
         end
 
@@ -401,6 +446,7 @@ for step = 0:nsteps
     end
 
     solve_time = toc(t_solve);
+    timing.solve = timing.solve + solve_time;
 
     % Unpack solution ONCE (no duplicate reshapes)
     [T, Tcap0, TcapL] = unpack_state_vec(Tvec, Nr, Ntheta, Nz, cap_z0, cap_zL);
@@ -417,9 +463,7 @@ for step = 0:nsteps
     %% =========================
     % Ab-implied energy and heat diagnostic (pre-deletion)
     %% =========================
-    % Mdiag should be cacheable, but keep as-is for now (you can cache later)
-    Mdiag = build_Mdiag_wall_endcap(r_faces, r_centers, dtheta, dz, rhoCp_ring, time.dt, cfg);
-
+    
     Tprev_vec = Tprev(:);
     if isfield(cfg,'endcap') && isfield(cfg.endcap,'enable') && cfg.endcap.enable
         if ~isfield(cfg.endcap,'ends'); cfg.endcap.ends = 'both'; end
@@ -432,7 +476,11 @@ for step = 0:nsteps
         end
     end
 
-    diagAb = energy_diag_from_Ab(A, b, Tvec, Tprev_vec, Mdiag, time.dt, Nwall);
+    t_diagAb = tic;
+    diagAb = energy_diag_from_Ab(A, b, Tvec, Tprev_vec, cache3D.Mdiag, time.dt, Nwall);
+    diagAb_time = toc(t_diagAb);
+    timing.diagAb = timing.diagAb + diagAb_time;
+
 
     dQimplied_hist(step+1)      = diagAb.dQ_implied_total;
     dQimplied_wall_hist(step+1) = diagAb.dQ_implied_wall;
@@ -457,6 +505,7 @@ for step = 0:nsteps
 
     n_inGrain_count = 0;
 
+    t_bc = tic;
     for kk = 1:Nz
         inGrain = grain_present(kk);
         n_inGrain_count = n_inGrain_count + double(inGrain);
@@ -505,6 +554,9 @@ for step = 0:nsteps
             dQ_out = dQ_out - dQ_into_solid_outer;
         end
     end
+    bc_time = toc(t_bc);
+    timing.bcHeat = timing.bcHeat + bc_time;
+
 
     dQnet_masked   = dQ_in_masked   - dQ_out;
     dQnet_unmasked = dQ_in_unmasked - dQ_out;
@@ -537,6 +589,7 @@ for step = 0:nsteps
     %% =========================
     E_removed_wall = 0.0;
 
+    t_del = tic;
     if willDelete
         for ii = 1:ndel
             r_imh = r_faces(ii);
@@ -546,6 +599,8 @@ for step = 0:nsteps
             E_removed_wall = E_removed_wall + rhoCp_ring(ii) * Vcell * sum(T_ring(:));
         end
     end
+    del_time = toc(t_del);
+    timing.deletion = timing.deletion + del_time;
 
     Erem_hist(step+1) = E_removed_wall;
 
@@ -663,6 +718,10 @@ for step = 0:nsteps
         layer_idx_of_ring(1:ndel) = [];
 
         Nr_after = numel(r_centers);
+        if exist('cache3D','var') && isstruct(cache3D)
+            cache3D.Mdiag = [];
+        end
+
         if Nr_after ~= (Nr_before - ndel)
             error('Nr observed mismatch: before=%d after=%d ndel=%d', Nr_before, Nr_after, ndel);
         end
@@ -690,14 +749,84 @@ for step = 0:nsteps
         closure_post_hist(step+1) = closure_pre_hist(step+1);
         closure_hist(step+1)      = closure_pre_hist(step+1);
     end
+    
+    % Instead, do the robust way: use the timing buckets you already accumulate.
+    % The per-step total is step_total; you subtract the per-step contributions you just added.
+    % Easiest drop-in: compute other as a residual from step_total and the known block durations you measured this step.
+    
+    % ---- drop-in: track per-step block durations explicitly ----
+    % Right after each toc(...) assign to a local var and add to timing.
+    % Then:
+    step_total = toc(t_step_total);
+    known_step = store_time + cache_time + asm_time + prec_time + solve_time + diagAb_time + bc_time + del_time;
+    timing.other = timing.other + max(step_total - known_step, 0);
 
 
 end
+
+total = sum(struct2array(timing));
+
+fprintf('\n===== TIMING SUMMARY =====\n');
+fprintf('Total runtime        : %.2f s\n', total);
+fprintf('Cache rebuild        : %.2f s (%.1f%%)\n', timing.cache,    100*timing.cache/total);
+fprintf('Assembly             : %.2f s (%.1f%%)\n', timing.assembly, 100*timing.assembly/total);
+fprintf('Preconditioner build : %.2f s (%.1f%%)\n', timing.prec,     100*timing.prec/total);
+fprintf('Linear solve         : %.2f s (%.1f%%)\n', timing.solve,    100*timing.solve/total);
+fprintf('Ab diagnostics       : %.2f s (%.1f%%)\n', timing.diagAb,   100*timing.diagAb/total);
+fprintf('BC heat diagnostics  : %.2f s (%.1f%%)\n', timing.bcHeat,   100*timing.bcHeat/total);
+fprintf('Deletion bookkeeping : %.2f s (%.1f%%)\n', timing.deletion, 100*timing.deletion/total);
+fprintf('Other                : %.2f s (%.1f%%)\n', timing.other,    100*timing.other/total);
+fprintf('==========================\n');
 
 %% Final axial profiles
 z_centers = ((1:cfg.Nz) - 0.5) * dz;
 Tin_z = squeeze(mean(T(1,:,:), 2));
 Tout_z = squeeze(mean(T(end,:,:), 2));
+
+%% =========================================================
+% FINAL OUTER-WALL TEMPERATURE SUMMARY
+% =========================================================
+
+% Safety checks
+assert(exist('Tout3D_store','var') == 1, 'Tout3D_store not found');
+assert(exist('t_store','var') == 1, 't_store not found');
+assert(exist('z_centers','var') == 1, 'z_centers not found');
+
+Nt = size(Tout3D_store, 3);
+
+%% -------- 1) Hottest time at a specific z-slice --------
+% Choose the z-slice you already plot or care about
+% Examples:
+%   z_query = Lg;              % grain end
+%   z_query = 0.0;             % bulkhead
+%   z_query = max(z_centers);  % nozzle end
+
+z_query = Lg;   % <<< CHANGE IF DESIRED
+
+[~, iz] = min(abs(z_centers - z_query));
+
+% Collapse theta, keep time
+Tz_time = squeeze(max(Tout3D_store(:, iz, :), [], 1));  % [Nt x 1]
+
+[Tz_max, it_zmax] = max(Tz_time);
+t_zmax = t_store(it_zmax);
+
+fprintf('\n===== OUTER WALL @ z = %.4f m =====\n', z_centers(iz));
+fprintf('Max temperature : %.2f K\n', Tz_max);
+fprintf('Time of max     : %.2f s\n', t_zmax);
+
+%% -------- 2) Global hottest outer-wall point (entire run) --------
+[Tglobal_max, idx] = max(Tout3D_store(:));
+
+[jmax, kmax, tmax] = ind2sub(size(Tout3D_store), idx);
+
+fprintf('\n===== GLOBAL OUTER WALL MAX =====\n');
+fprintf('Max temperature : %.2f K\n', Tglobal_max);
+fprintf('Time            : %.2f s\n', t_store(tmax));
+fprintf('Axial location  : z = %.4f m\n', z_centers(kmax));
+fprintf('Theta index     : %d / %d\n', jmax, size(Tout3D_store,1));
+fprintf('=================================\n\n');
+
 
 figure;
 plot(z_centers, Tin_z, 'LineWidth', 2); hold on;
@@ -709,7 +838,6 @@ legend('Inner wall (mean over \theta)','Outer wall (mean over \theta)','Location
 title('Axial temperature profiles at final time');
 
 plot_results(snap, layers, geom, burn, BC);
-fprintf('Maximum Outer Wall Temperature %f at %f seconds\n', max(TbarMat), find(TbarMat))
 
 %% ==================== 3D tube animation + GIF export (outer surface) ====================
 if exist('Tout3D_store','var') && ~isempty(Tout3D_store)
@@ -942,8 +1070,9 @@ b = zeros(N,1);
 idx = 0;
 
 % Periodic theta indexing
-jp = @(j) (j < Ntheta) * (j+1) + (j==Ntheta) * 1;
-jm = @(j) (j > 1)     * (j-1) + (j==1)     * Ntheta;
+jp = [2:Ntheta 1];
+jm = [Ntheta 1:Ntheta-1];
+
 
 % Endcap node indices (if present)
 p_cap0 = [];
@@ -1064,7 +1193,7 @@ for kk = 1:Nz
                 GW     = k_face * Aface / dW;
 
                 idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + GW;
-                q = sub2ind([Nr,Ntheta,Nz], i-1, j, kk);
+                q = p_all(i-1,j,kk);
                 idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx) - GW;
 
             else
@@ -1137,7 +1266,7 @@ for kk = 1:Nz
                 GE     = k_face * Aface / dE;
 
                 idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + GE;
-                q = sub2ind([Nr,Ntheta,Nz], i+1, j, kk);
+                q = p_all(i+1, j, kk);
                 idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx) - GE;
 
             else
@@ -1161,8 +1290,8 @@ for kk = 1:Nz
             Gth    = k_ring(i) * Atheta / ds;
 
             jE = jp(j); jW = jm(j);
-            qE = sub2ind([Nr,Ntheta,Nz], i, jE, kk);
-            qW = sub2ind([Nr,Ntheta,Nz], i, jW, kk);
+            qE = p_all(i, jE, kk);
+            qW = p_all(i, jW, kk);
 
             idx=idx+1; I(idx)=p; J(idx)=p;  V(idx)=V(idx) + 2*Gth;
             idx=idx+1; I(idx)=p; J(idx)=qE; V(idx)=V(idx) - Gth;
@@ -1173,7 +1302,7 @@ for kk = 1:Nz
             Gz = k_ring(i) * Az / dz;
 
             if kk > 1
-                q = sub2ind([Nr,Ntheta,Nz], i, j, kk-1);
+                q = p_all(i,j,kk-1);
                 idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + Gz;
                 idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx) - Gz;
             else
@@ -1196,7 +1325,7 @@ for kk = 1:Nz
             end
 
             if kk < Nz
-                q = sub2ind([Nr,Ntheta,Nz], i, j, kk+1);
+                q = p_all(i, j, kk+1);
                 idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx) + Gz;
                 idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx) - Gz;
             else
@@ -1736,21 +1865,24 @@ title(tl, figTitle);
 
 end
 
-function [h_rad, q_const] = rad_lin_coeff(eps, sigma, Tw0, Tenv)
-%RAD_LIN_COEFF Linearize radiation heat flux about Tw0.
-%
-% Radiation heat flux into the surface (positive into solid):
-%   q'' = eps*sigma*(Tenv^4 - Tw^4)
-%
-% Linearization about Tw0:
-%   q'' ≈ h_rad*(Tenv - Tw) + q_const
-% where:
-%   h_rad  = 4*eps*sigma*Tw0^3
+function [h_eff, q_const] = rad_lin_coeff(eps, sigma, Tw0, Tenv)
+%RAD_LIN_COEFF Linearized radiation: q_rad = eps*sigma*(Tenv^4 - Tw^4)
+% Linearize about Tw0:
+%   q_rad ≈ h_rad*(Tenv - Tw) + q_const
+% where
+%   h_rad   = 4*eps*sigma*Tw0^3
 %   q_const = eps*sigma*(Tenv^4 - Tw0^4) - h_rad*(Tenv - Tw0)
 
-Tw0 = max(Tw0, 1e-6);  % avoid zero/negative issues
-h_rad = 4 * eps * sigma * (Tw0^3);
-q_const = eps * sigma * (Tenv^4 - Tw0^4) - h_rad * (Tenv - Tw0);
+    Tw0 = max(Tw0, 1.0);  % avoid 0^3 issues; supports scalar or vector
+    Tenv4 = Tenv.^4;      % scalar or vector safe
+    Tw04  = Tw0.^4;
+
+    h_rad = 4 * eps * sigma .* (Tw0.^3);
+
+    % constant term to keep linearization exact at Tw=Tw0
+    q_const = eps * sigma .* (Tenv4 - Tw04) - h_rad .* (Tenv - Tw0);
+
+    h_eff = h_rad;
 end
 
 function hm = harmonic_mean(a, b)
@@ -1888,6 +2020,7 @@ end
 function cache = build_BE_polar3D_cache(r_faces, r_centers, dtheta, dz, k_ring, rhoCp_ring, dt, cfg, Lg, Ntheta, Nz)
 Nr = numel(r_centers);
 Nwall = Nr*Ntheta*Nz;
+p_all = reshape(1:Nwall, [Nr, Ntheta, Nz]);  % linear indices
 
 useEndcap = isfield(cfg,'endcap') && isfield(cfg.endcap,'enable') && cfg.endcap.enable;
 cap_z0 = false; cap_zL = false;
@@ -1913,24 +2046,28 @@ z_centers = ((1:Nz) - 0.5) * dz;
 jList = jGrid(:);
 kList = kGrid(:);
 
-idx_i1  = sub2ind([Nr, Ntheta, Nz], ones(size(jList)), jList, kList);
-idx_iNr = sub2ind([Nr, Ntheta, Nz], Nr*ones(size(jList)), jList, kList);
+idx_i1  = p_all(1,:,:);  idx_i1  = idx_i1(:);
+idx_iNr = p_all(Nr,:,:); idx_iNr = idx_iNr(:);
+cache.kList_i1 = kList;
 
-cache.kList_i1 = kList;   % k index aligned with idx_i1 ordering
+% ---- aP_wall: transient diagonal per wall node (vectorized, correct shape) ----
+r_imh = r_faces(1:Nr);
+r_iph = r_faces(2:Nr+1);
 
-% Cache aP_wall as a vector (wall unknowns only)
-aP_wall = zeros(Nwall,1);
-for kk=1:Nz
-    for j=1:Ntheta
-        for i=1:Nr
-            p = sub2ind([Nr,Ntheta,Nz], i, j, kk);
-            r_imh = r_faces(i);
-            r_iph = r_faces(i+1);
-            Vcv = 0.5*(r_iph^2 - r_imh^2) * dtheta * dz;
-            aP_wall(p) = rhoCp_ring(i) * Vcv / dt;
-        end
-    end
-end
+r_imh = r_imh(:);     % force [Nr x 1]
+r_iph = r_iph(:);     % force [Nr x 1]
+
+Vcv_i = 0.5*(r_iph.^2 - r_imh.^2) * dtheta * dz;   % [Nr x 1]
+
+rhoCp_ring = rhoCp_ring(:);
+k_ring     = k_ring(:);
+assert(numel(rhoCp_ring) == Nr, 'rhoCp_ring must be length Nr. Got %d, Nr=%d', numel(rhoCp_ring), Nr);
+assert(numel(k_ring)     == Nr, 'k_ring must be length Nr. Got %d, Nr=%d', numel(k_ring), Nr);
+aP_i  = (rhoCp_ring(:) .* Vcv_i) / dt;                  % [Nr x 1]
+aP_wall_3D = repmat(aP_i(:), 1, Ntheta, Nz);   % [Nr x Ntheta x Nz]
+aP_wall    = aP_wall_3D(:);                   % [Nwall x 1]
+assert(numel(aP_wall) == Nwall, 'aP_wall numel mismatch: %d vs Nwall %d', numel(aP_wall), Nwall);
+
 
 % Build A_base (conduction + transient + endcap coupling only)
 % Estimate nonzeros per row ~ 10..14
@@ -1941,13 +2078,13 @@ V = zeros(nz_est,1);
 idx = 0;
 
 % theta periodic
-jp = @(j) (j < Ntheta) * (j+1) + (j==Ntheta) * 1;
-jm = @(j) (j > 1)     * (j-1) + (j==1)     * Ntheta;
+jp = [2:Ntheta 1];
+jm = [Ntheta 1:Ntheta-1];
 
 for kk=1:Nz
     for j=1:Ntheta
         for i=1:Nr
-            p = sub2ind([Nr,Ntheta,Nz], i, j, kk);
+            p = p_all(i,j,kk);
 
             r_imh = r_faces(i);
             r_iph = r_faces(i+1);
@@ -1962,7 +2099,7 @@ for kk=1:Nz
                 GW     = k_face * Aface / dW;
 
                 idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx)+GW;
-                q = sub2ind([Nr,Ntheta,Nz], i-1, j, kk);
+                q = p_all(i-1,j,kk);
                 idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx)-GW;
             end
             if i < Nr
@@ -1973,7 +2110,7 @@ for kk=1:Nz
                 GE     = k_face * Aface / dE;
 
                 idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx)+GE;
-                q = sub2ind([Nr,Ntheta,Nz], i+1, j, kk);
+                q = p_all(i+1, j, kk);
                 idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx)-GE;
             end
 
@@ -1984,8 +2121,8 @@ for kk=1:Nz
             Gth    = k_ring(i) * Atheta / ds;
 
             jE = jp(j); jW = jm(j);
-            qE = sub2ind([Nr,Ntheta,Nz], i, jE, kk);
-            qW = sub2ind([Nr,Ntheta,Nz], i, jW, kk);
+            qE = p_all(i, jE, kk);
+            qW = p_all(i, jW, kk);
 
             idx=idx+1; I(idx)=p; J(idx)=p;  V(idx)=V(idx) + 2*Gth;
             idx=idx+1; I(idx)=p; J(idx)=qE; V(idx)=V(idx) - Gth;
@@ -1996,7 +2133,7 @@ for kk=1:Nz
             Gz = k_ring(i) * Az / dz;
 
             if kk > 1
-                q = sub2ind([Nr,Ntheta,Nz], i, j, kk-1);
+                q = p_all(i,j,kk-1);
                 idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx)+Gz;
                 idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx)-Gz;
             else
@@ -2014,7 +2151,7 @@ for kk=1:Nz
             end
 
             if kk < Nz
-                q = sub2ind([Nr,Ntheta,Nz], i, j, kk+1);
+                q = p_all(i, j, kk+1);
                 idx=idx+1; I(idx)=p; J(idx)=p; V(idx)=V(idx)+Gz;
                 idx=idx+1; I(idx)=p; J(idx)=q; V(idx)=V(idx)-Gz;
             else
@@ -2075,7 +2212,9 @@ cache.dtheta = dtheta; cache.dz = dz;
 cache.z_centers = z_centers;
 
 cache.A_base = A_base;
-cache.aP_wall = aP_wall;
+assert(isvector(aP_wall), 'aP_wall is not a vector, size=%s', mat2str(size(aP_wall)));
+assert(numel(aP_wall) == Nwall, 'aP_wall numel mismatch: %d vs Nwall %d', numel(aP_wall), Nwall);
+cache.aP_wall = full(aP_wall(:));
 
 cache.idx_i1 = idx_i1;
 cache.idx_iNr = idx_iNr;
@@ -2088,12 +2227,22 @@ cache.aPcap = aPcap;
 end
 
 function [A, b] = assemble_from_cache_BE_polar3D(cache, Tprev, Tcap0_prev, TcapL_prev, BC, T_gas, cfg, Lg)
+% --- Start from cached base ---
+A = cache.A_base;
+
+% --- Accumulate ONLY diagonal BC contributions here (size N x 1) ---
+diag_add = zeros(cache.N,1);
+b_add = zeros(cache.N,1);
+
 N = cache.N;
 Nwall = cache.Nwall;
 
 % Start with transient RHS (vectorized)
 b = zeros(N,1);
-b(1:Nwall) = cache.aP_wall .* Tprev(:);
+ap = cache.aP_wall(:);
+Tp = Tprev(:);
+assert(numel(ap) == numel(Tp), 'aP_wall (%d) and Tprev (%d) size mismatch', numel(ap), numel(Tp));
+b(1:Nwall) = ap .* Tp;
 
 % Endcap transient RHS
 useEndcap = cache.Ncap > 0;
@@ -2105,9 +2254,6 @@ if useEndcap
         b(cache.p_capL) = b(cache.p_capL) + cache.aPcap * TcapL_prev;
     end
 end
-
-% BC diagonal additions
-diag_add = zeros(N,1);
 
 Nr = cache.Nr; Ntheta = cache.Ntheta; Nz = cache.Nz;
 z_centers = cache.z_centers;
@@ -2145,74 +2291,96 @@ end
 
 % ---------- Inner wall BC (i=1) ----------
 idx_i1 = cache.idx_i1;                    % length Ntheta*Nz
-Tw_i1 = Tprev(idx_i1);                    % uses column-major consistent with Tprev(:)
-Aface = cache.Ain_face;
+Tw_i1  = Tprev(idx_i1);
+Aface  = cache.Ain_face;
 
-% We need per-(j,kk) info; j doesn’t matter for BC coefficients, kk does
-% Build kk list aligned with idx_i1 construction in cache
 % --- k-index list for i==1 nodes (must match idx_i1 ordering) ---
 if isfield(cache,'kList_i1') && ~isempty(cache.kList_i1)
-    kk_list = cache.kList_i1;
+    kk_list = cache.kList_i1(:);
 else
-    % Backward-compatible fallback for old caches
-    [~, kGrid] = ndgrid(1:Ntheta, 1:Nz);  % ndgrid matches idx_i1 construction
+    [~, kGrid] = ndgrid(1:Ntheta, 1:Nz);
     kk_list = kGrid(:);
 end
 
+inGrain = grain_present(kk_list);     % logical, length(idx_i1)
 
-for t = 1:numel(idx_i1)
-    p = idx_i1(t);
-    kk = kk_list(t);
-    Tw0 = Tw_i1(t);
+% =====================
+% Grain-present region
+% =====================
+if any(inGrain)
+    pG  = idx_i1(inGrain);
+    TwG = Tw_i1(inGrain);
+    mG  = m_in(kk_list(inGrain));
 
-    if grain_present(kk)
-        m = m_in(kk);
-        [h_eff, q_const] = rad_lin_coeff(BC.eps_in, BC.sigma, Tw0, T_gas);
-        h_total = m * (BC.h_in + h_eff);
-        if h_total > 0
-            diag_add(p) = diag_add(p) + h_total*Aface;
-            b(p) = b(p) + h_total*Aface*T_gas + m*q_const*Aface;
-        end
-    else
-        % aft cavity region
-        if isfield(BC,'T_gas_cav_mode') && strcmpi(BC.T_gas_cav_mode,'ambient')
-            Tenv = BC.T_amb;
-        else
-            Tenv = T_gas;
-        end
+    [h_effG, q_constG] = rad_lin_coeff(BC.eps_in, BC.sigma, TwG, T_gas);
+    htotG = mG .* (BC.h_in + h_effG);
 
-        eps_cav = BC.eps_in_cav;
-        h_cav = cfg.noz.h_cav_base;
+    active = (htotG > 0);
+    if any(active)
+        pG = pG(active);
+        htotG = htotG(active);
+        mG = mG(active);
+        q_constG = q_constG(active);
 
-        if useNozProxy
-            ratio = cfg.noz.CdA * (At / max(Aport, 1e-12));
-            h_cav = cfg.noz.h_cav_base * (ratio ^ cfg.noz.alpha);
-            h_cav = min(max(h_cav, cfg.noz.h_cav_min), cfg.noz.h_cav_max);
-        end
-
-        [h_eff, q_const] = rad_lin_coeff(eps_cav, BC.sigma, Tw0, Tenv);
-        h_total = h_cav + h_eff;
-        if h_total > 0
-            diag_add(p) = diag_add(p) + h_total*Aface;
-            b(p) = b(p) + h_total*Aface*Tenv + q_const*Aface;
-        end
+        diag_add(pG) = diag_add(pG) + htotG * Aface;
+        b(pG)        = b(pG)        + (htotG * Aface) .* T_gas + (mG .* q_constG) * Aface;
     end
 end
 
-% ---------- Outer wall BC (i=Nr) ----------
-idx_iNr = cache.idx_iNr;
-Tw_iNr = Tprev(idx_iNr);
-Aface_out = cache.Aout_face;
+% =====================
+% Aft cavity region
+% =====================
+if any(~inGrain)
+    pC  = idx_i1(~inGrain);
+    TwC = Tw_i1(~inGrain);
 
-for t = 1:numel(idx_iNr)
-    p = idx_iNr(t);
-    Tw0 = Tw_iNr(t);
-    [h_eff, q_const] = rad_lin_coeff(BC.eps_out, BC.sigma, Tw0, BC.T_amb);
-    h_total = BC.h_out + h_eff;
-    if h_total > 0
-        diag_add(p) = diag_add(p) + h_total*Aface_out;
-        b(p) = b(p) + h_total*Aface_out*BC.T_amb + q_const*Aface_out;
+    if isfield(BC,'T_gas_cav_mode') && strcmpi(BC.T_gas_cav_mode,'ambient')
+        Tenv = BC.T_amb;
+    else
+        Tenv = T_gas;
     end
+
+    eps_cav = BC.eps_in_cav;
+
+    % h_cav may be constant or nozzle-scaled, but it is the same for all cavity faces
+    h_cav = cfg.noz.h_cav_base;
+    if useNozProxy
+        ratio = cfg.noz.CdA * (At / max(Aport, 1e-12));
+        h_cav = cfg.noz.h_cav_base * (ratio ^ cfg.noz.alpha);
+        h_cav = min(max(h_cav, cfg.noz.h_cav_min), cfg.noz.h_cav_max);
+    end
+
+    [h_effC, q_constC] = rad_lin_coeff(eps_cav, BC.sigma, TwC, Tenv);
+    htotC = h_cav + h_effC;
+
+    active = (htotC > 0);
+    if any(active)
+        pC = pC(active);
+        htotC = htotC(active);
+        q_constC = q_constC(active);
+
+        diag_add(pC) = diag_add(pC) + htotC * Aface;
+        b(pC)        = b(pC)        + (htotC * Aface) .* Tenv + (q_constC * Aface);
+    end
+end
+
+
+% ---------- Outer wall BC (i=Nr) ----------
+idx_iNr    = cache.idx_iNr;
+Tw_iNr     = Tprev(idx_iNr);
+Aface_out  = cache.Aout_face;
+
+[h_effO, q_constO] = rad_lin_coeff(BC.eps_out, BC.sigma, Tw_iNr, BC.T_amb);
+htotO = BC.h_out + h_effO;
+
+active = (htotO > 0);
+if any(active)
+    pO = idx_iNr(active);
+    htotO = htotO(active);
+    q_constO = q_constO(active);
+
+    diag_add(pO) = diag_add(pO) + htotO * Aface_out;
+    b(pO)        = b(pO)        + (htotO * Aface_out) .* BC.T_amb + (q_constO * Aface_out);
 end
 
 % ---------- Endcap lumped BCs ----------
