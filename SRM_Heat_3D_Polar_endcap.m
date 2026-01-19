@@ -16,6 +16,7 @@ prop.name = 'APCP';
 prop.k = 0.35;
 prop.rho = 1700;
 prop.cp = 1200;
+prop.burnrate = 0.002383; % [m/s]
 
 liner.name = 'EPDM';
 liner.k = 0.20;
@@ -27,28 +28,34 @@ caseCF.k = 1.0;
 caseCF.rho = 1600;
 caseCF.cp = 900;
 
+caseAl.name = 'Aluminum';
+caseAl.k   = 205;     % W/m-K
+caseAl.rho = 2700;    % kg/m^3
+caseAl.cp  = 900;     % J/kg-K
+
 % layers
 layers = struct([]);
 layers(1).material = prop;
-layers(1).thickness = 0.0143;
+layers(1).thickness = 0.0824;
 layers(2).material = liner;
-layers(2).thickness = 0.002;
-layers(3).material = caseCF;
-layers(3).thickness = 0.00338;
+layers(2).thickness = 0.004;
+layers(3).material = caseAl;
+layers(3).thickness = 0.0127;
 
 % geometry / burn
-geom.r_inner0 = 0.050;
-burn.t_burn = 6;
-burn.rburn  = layers(1).thickness / burn.t_burn;
+geom.r_inner0 = 0.015;
+burn.rburn = prop.burnrate;
+burn.t_burn = layers(1).thickness / burn.rburn;   % [s]
+
 
 cfg.store_every = 1;     % store every N steps
-cfg.max_cells = 4e6;      % safety
-cfg.Ntheta = 64;          % circumferential resolution (>= 8)
+cfg.max_cells = 20e6;      % safety
+cfg.Ntheta = 16;          % circumferential resolution (>= 8)
 cfg.Nz = 600;              % axial resolution (>=1)
 cfg.endBC = 'adiabatic';    % 'adiabatic' or 'robin' at z=0 and z=L
 
-time.dt = 0.090;
-time.t_final = 100.0;
+time.dt = 0.1;
+time.t_final = 200.0;
 
 % boundary conditions
 BC.T_gas = 2300;          % "inner" gas temperature
@@ -66,7 +73,7 @@ BC.T_gas_cav_mode = 'same';  % 'same' uses T_gas, or 'ambient' uses BC.T_amb
 
 BC.h_z0 = 30;               % end convection at z=0 if endBC='robin'
 BC.h_zL = 30;               % end convection at z=L if endBC='robin'
-cfg.L = 1.0;              % unit length (m)
+cfg.L = 1.66;              % unit length (m)
 
 
 
